@@ -31,10 +31,10 @@ import {
 } from "./rpc";
 import { awaitStackRegistrations, excessiveDebugOutput, getMonitor, rpcKeepAlive, terminateRpcs } from "./settings";
 
-import { DependencyResource, ProviderResource, Resource } from "../resource";
+import { CustomResource, DependencyResource, ProviderResource, Resource } from "../resource";
 import * as utils from "../utils";
 import { PushableAsyncIterable } from "./asyncIterableUtil";
-import { gatherExplicitDependencies } from "./dependsOn";
+import { gatherExplicitDependencies, getAllTransitivelyReferencedResources } from "./dependsOn";
 
 import * as gstruct from "google-protobuf/google/protobuf/struct_pb";
 import * as resourceproto from "../proto/resource_pb";
@@ -238,9 +238,9 @@ async function invokeAsync(
     // Wait for all values to be available, and then perform the RPC.
     const done = rpcKeepAlive();
     try {
-        // Wait for any explicit dependencies to complete before proceeding.
+        // The direct dependencies of the invoke call from the dependsOn option.
         const dependsOnDeps = await gatherExplicitDependencies(opts.dependsOn);
-
+        // The dependencies of the inputs to the invoke call.
         const [serialized, deps] = await serializePropertiesReturnDeps(`invoke:${tok}`, props);
         if (containsUnknownValues(serialized)) {
             // if any of the input properties are unknown,
@@ -251,6 +251,33 @@ async function invokeAsync(
                 containsSecrets: false,
                 dependencies: [],
             };
+        }
+        // If we depend on any CustomResources, we need to ensure that their
+        // ID is known before proceeding. If it is not known, we will return
+        // an unknown result.
+        const resourcesToWaitFor = new Set<Resource>(dependsOnDeps);
+        // Add the dependencies from the inputs to the set of resources to wait for.
+        for (const resourceDeps of deps.values()) {
+            for (const value of resourceDeps.values()) {
+                resourcesToWaitFor.add(value);
+            }
+        }
+        // The expanded set of dependencies, including children of components.
+        const expandedDeps = await getAllTransitivelyReferencedResources(resourcesToWaitFor, new Set());
+        // Ensure that all resource IDs are known before proceeding.
+        for (const dep of expandedDeps.values()) {
+            // DependencyResources inherit from CustomResource, but they don't set the id. Skip them.
+            if (CustomResource.isInstance(dep) && dep.id) {
+                const known = await dep.id.isKnown;
+                if (!known) {
+                    return {
+                        result: {},
+                        isKnown: false,
+                        containsSecrets: false,
+                        dependencies: [],
+                    };
+                }
+            }
         }
 
         log.debug(

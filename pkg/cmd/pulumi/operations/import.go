@@ -58,7 +58,6 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 
-	javagen "github.com/pulumi/pulumi-java/pkg/codegen/java"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/dotnet"
 )
 
@@ -517,22 +516,31 @@ func generateImportedDefinitions(ctx *plugin.Context,
 	}
 
 	loader := schema.NewPluginLoader(ctx.Host)
-	return true, importer.GenerateLanguageDefinitions(out, loader, func(w io.Writer, p *pcl.Program) error {
-		files, _, err := programGenerator(p, loader)
-		if err != nil {
-			return err
-		}
+	err := importer.GenerateLanguageDefinitions(
+		out,
+		loader,
+		func(w io.Writer, p *pcl.Program) error {
+			files, _, err := programGenerator(p, loader)
+			if err != nil {
+				return err
+			}
 
-		var contents []byte
-		for _, v := range files {
-			contents = v
-		}
+			var contents []byte
+			for _, v := range files {
+				contents = v
+			}
 
-		if _, err := w.Write(contents); err != nil {
-			return err
-		}
-		return nil
-	}, resources, names)
+			if _, err := w.Write(contents); err != nil {
+				return err
+			}
+			return nil
+		},
+		resources,
+		snap.Resources,
+		names,
+	)
+
+	return true, err
 }
 
 func NewImportCmd() *cobra.Command {
@@ -705,9 +713,10 @@ func NewImportCmd() *cobra.Command {
 						pCtx.Diag.Logf(sev, diag.RawMessage("", msg))
 					}
 
-					pluginSpec := workspace.PluginSpec{
-						Name: string(provider),
-						Kind: apitype.ResourcePlugin,
+					pluginSpec, err := workspace.NewPluginSpec(string(provider), apitype.ResourcePlugin, nil, "", nil)
+					if err != nil {
+						pCtx.Diag.Warningf(diag.Message("", "failed to create plugin spec for provider %q: %v"), provider, err)
+						return nil
 					}
 					version, err := pkgWorkspace.InstallPlugin(ctx, pluginSpec, log)
 					if err != nil {
@@ -875,8 +884,6 @@ func NewImportCmd() *cobra.Command {
 			switch proj.Runtime.Name() {
 			case "dotnet":
 				programGenerator = wrapper(dotnet.GenerateProgram)
-			case "java":
-				programGenerator = wrapper(javagen.GenerateProgram)
 			default:
 				programGenerator = func(
 					program *pcl.Program, loader schema.ReferenceLoader,

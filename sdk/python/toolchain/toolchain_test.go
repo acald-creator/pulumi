@@ -130,20 +130,40 @@ func TestCommand(t *testing.T) {
 func TestListPackages(t *testing.T) {
 	t.Parallel()
 
-	for _, opts := range []PythonOptions{
+	for _, test := range []struct {
+		opts             PythonOptions
+		expectedPackages []string
+	}{
 		{
-			Toolchain:  Pip,
-			Virtualenv: "venv",
+			opts: PythonOptions{
+				Toolchain:  Pip,
+				Virtualenv: "venv",
+			},
+			// The virtualenv created by the pip toolchain always has pip
+			// installed. Additionally it always installs setuptools and wheel
+			// into the virtualenv.
+			expectedPackages: []string{"pip", "setuptools", "wheel"},
 		},
 		{
-			Toolchain: Poetry,
+			opts: PythonOptions{
+				Toolchain: Poetry,
+			},
+			// Virtual environments created by Poetry always include pip.
+			expectedPackages: []string{"pip"},
+		},
+		{
+			opts: PythonOptions{
+				Toolchain: Uv,
+			},
+			// Virtual environments created by uv are empty.
+			expectedPackages: []string{},
 		},
 	} {
-		opts := opts
+		test := test
 
-		t.Run("empty/"+Name(opts.Toolchain), func(t *testing.T) {
+		t.Run("empty/"+Name(test.opts.Toolchain), func(t *testing.T) {
 			t.Parallel()
-			opts := copyOptions(opts)
+			opts := copyOptions(test.opts)
 			opts.Root = t.TempDir()
 			createVenv(t, opts)
 
@@ -152,15 +172,15 @@ func TestListPackages(t *testing.T) {
 
 			packages, err := tc.ListPackages(context.Background(), false)
 			require.NoError(t, err)
-			require.Len(t, packages, 3)
-			require.Equal(t, "pip", packages[0].Name)
-			require.Equal(t, "setuptools", packages[1].Name)
-			require.Equal(t, "wheel", packages[2].Name)
+			require.Len(t, packages, len(test.expectedPackages))
+			for i, pkg := range test.expectedPackages {
+				require.Equal(t, pkg, packages[i].Name)
+			}
 		})
 
-		t.Run("non-empty/"+Name(opts.Toolchain), func(t *testing.T) {
+		t.Run("non-empty/"+Name(test.opts.Toolchain), func(t *testing.T) {
 			t.Parallel()
-			opts := copyOptions(opts)
+			opts := copyOptions(test.opts)
 			opts.Root = t.TempDir()
 			createVenv(t, opts, "pulumi-random")
 
@@ -168,15 +188,58 @@ func TestListPackages(t *testing.T) {
 			require.NoError(t, err)
 
 			packages, err := tc.ListPackages(context.Background(), false)
+			require.NoError(t, err)
 			sort.Slice(packages, func(i, j int) bool {
 				return packages[i].Name < packages[j].Name
 			})
+			// pulumi_random depends on pulumi, which has pip as a dependency.
+			// We are looking for packages that are not dependencies of other
+			// packages, so we have to exclude pip here.
+			var expectedPackages []string
+			for _, pkg := range append([]string{"pulumi_random"}, test.expectedPackages...) {
+				if pkg != "pip" {
+					expectedPackages = append(expectedPackages, pkg)
+				}
+			}
+			sort.Strings(expectedPackages)
+
+			require.Len(t, packages, len(expectedPackages))
+			for i, pkg := range expectedPackages {
+				require.Equal(t, pkg, packages[i].Name)
+			}
+		})
+
+		t.Run("non-empty-with-pip/"+Name(test.opts.Toolchain), func(t *testing.T) {
+			t.Parallel()
+			opts := copyOptions(test.opts)
+			opts.Root = t.TempDir()
+			createVenv(t, opts, "pulumi-random", "pip")
+
+			tc, err := ResolveToolchain(opts)
 			require.NoError(t, err)
-			require.Len(t, packages, 4)
-			require.Equal(t, "pip", packages[0].Name)
-			require.Equal(t, "pulumi_random", packages[1].Name)
-			require.Equal(t, "setuptools", packages[2].Name)
-			require.Equal(t, "wheel", packages[3].Name)
+
+			packages, err := tc.ListPackages(context.Background(), false)
+			require.NoError(t, err)
+			sort.Slice(packages, func(i, j int) bool {
+				return packages[i].Name < packages[j].Name
+			})
+
+			// pulumi_random depends on pulumi, which has pip as a dependency.
+			// We are looking for packages that are not dependencies of other
+			// packages, so we have to exclude pip here.
+			var expectedPackages []string
+			for _, pkg := range append([]string{"pulumi_random"}, test.expectedPackages...) {
+				if pkg != "pip" {
+					expectedPackages = append(expectedPackages, pkg)
+				}
+			}
+			expectedPackages = unique(expectedPackages)
+			sort.Strings(expectedPackages)
+
+			require.Len(t, packages, len(expectedPackages))
+			for i, pkg := range expectedPackages {
+				require.Equal(t, pkg, packages[i].Name)
+			}
 		})
 	}
 }
@@ -292,7 +355,7 @@ func createVenv(t *testing.T, opts PythonOptions, packages ...string) {
 			require.NoError(t, cmd.Run())
 		}
 	} else if opts.Toolchain == Poetry {
-		writePyproject(t, opts)
+		writePyprojectForPoetry(t, opts.Root)
 		// Write poetry.toml file to enable in-project virtualenvs. This ensures we delete the
 		// virtualenv with the tmp directory after the test is done.
 		writePoetryToml(t, opts.Root)
@@ -305,16 +368,46 @@ func createVenv(t *testing.T, opts PythonOptions, packages ...string) {
 		for _, pkg := range packages {
 			cmd := exec.Command("poetry", "add", pkg)
 			cmd.Dir = opts.Root
-			err := cmd.Run()
-			require.NoError(t, err)
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+		}
+	} else if opts.Toolchain == Uv {
+		writePyprojectForUv(t, opts.Root)
+		tc, err := ResolveToolchain(opts)
+		require.NoError(t, err)
+		err = tc.InstallDependencies(context.Background(), opts.Root, false, /*useLanguageVersionTools*/
+			true /*showOutput */, os.Stdout, os.Stderr)
+		require.NoError(t, err)
+
+		for _, pkg := range packages {
+			cmd := exec.Command("uv", "add", pkg)
+			cmd.Dir = opts.Root
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, string(out))
 		}
 	}
 }
 
-func writePyproject(t *testing.T, opts PythonOptions) {
+func writePyprojectForUv(t *testing.T, root string) {
 	t.Helper()
 
-	f, err := os.OpenFile(filepath.Join(opts.Root, "pyproject.toml"), os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(filepath.Join(root, "pyproject.toml"), os.O_CREATE|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	fmt.Fprint(f, `
+[project]
+name = "list-packages-test"
+version = "0.0.1"
+requires-python = ">=3.9"
+dependencies = []
+`)
+	err = f.Close()
+	require.NoError(t, err)
+}
+
+func writePyprojectForPoetry(t *testing.T, root string) {
+	t.Helper()
+
+	f, err := os.OpenFile(filepath.Join(root, "pyproject.toml"), os.O_CREATE|os.O_WRONLY, 0o600)
 	require.NoError(t, err)
 	fmt.Fprint(f, `
 [build-system]
@@ -331,10 +424,7 @@ package-mode = false
 packages = [{include = "test_pulumi_venv"}]
 
 [tool.poetry.dependencies]
-python = "^3.8"
-pip = "*"
-setuptools = "*"
-wheel = "*"
+python = "^3.9"
 `)
 	err = f.Close()
 	require.NoError(t, err)
@@ -347,6 +437,8 @@ func writePoetryToml(t *testing.T, path string) {
 	require.NoError(t, err)
 	fmt.Fprint(f, `[virtualenvs]
 in-project = true
+[virtualenvs.options]
+no-setuptools = true
 `)
 	err = f.Close()
 	require.NoError(t, err)
@@ -360,6 +452,18 @@ func copyOptions(opts PythonOptions) PythonOptions {
 		Typechecker: opts.Typechecker,
 		Toolchain:   opts.Toolchain,
 	}
+}
+
+func unique(s []string) []string {
+	u := make([]string, 0, len(s))
+	m := make(map[string]bool)
+	for _, val := range s {
+		if _, ok := m[val]; !ok {
+			m[val] = true
+			u = append(u, val)
+		}
+	}
+	return u
 }
 
 // normalizePath resolves symlinks within the directory part of the given path.

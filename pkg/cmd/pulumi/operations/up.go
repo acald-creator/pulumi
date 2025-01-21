@@ -176,12 +176,9 @@ func NewUpCmd() *cobra.Command {
 			return err
 		}
 
-		var autonamer autonaming.Autonamer
-		if env.Experimental.Value() {
-			autonamer, err = autonaming.ParseAutonamingConfig(autonamingStackContext(proj, s), cfg.Config, decrypter)
-			if err != nil {
-				return fmt.Errorf("getting autonaming config: %w", err)
-			}
+		autonamer, err := autonaming.ParseAutonamingConfig(autonamingStackContext(proj, s), cfg.Config, decrypter)
+		if err != nil {
+			return fmt.Errorf("getting autonaming config: %w", err)
 		}
 
 		opts.Engine = engine.UpdateOptions{
@@ -614,7 +611,7 @@ func NewUpCmd() *cobra.Command {
 		"Print detailed debugging output during resource operations")
 	cmd.PersistentFlags().BoolVar(
 		&expectNop, "expect-no-changes", false,
-		"Return an error if any changes occur during this update")
+		"Return an error if any changes occur during this update. This check happens after the update is applied")
 	cmd.PersistentFlags().StringVarP(
 		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")
