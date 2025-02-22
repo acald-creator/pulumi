@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -180,6 +182,13 @@ func runNew(ctx context.Context, args newArgs) error {
 		if aiOrTemplate == "ai" {
 			checkedBackend, ok := b.(httpstate.Backend)
 			if !ok {
+				if args.aiLanguage != "" && args.aiPrompt == "" {
+					return errors.New(
+						"--language is used to generate a template with Pulumi AI. " +
+							"Please log in to Pulumi Cloud to use Pulumi AI.\n" +
+							"Use --template to create a project from a template, " +
+							"or no flags to choose one interactively.")
+				}
 				return errors.New("please log in to Pulumi Cloud to use Pulumi AI")
 			}
 			conversationURL, err := runAINew(ctx, args, opts, checkedBackend)
@@ -190,11 +199,23 @@ func runNew(ctx context.Context, args newArgs) error {
 		}
 	}
 	// Retrieve the template repo.
-	repo, err := workspace.RetrieveTemplates(
+	var repo workspace.TemplateRepository
+	repo, err = workspace.RetrieveTemplates(
 		ctx, args.templateNameOrURL, args.offline, workspace.TemplateKindPulumiProject)
 	if err != nil {
-		return err
+		// Bail on all errors unless its a 401 from a Pulumi Cloud backend...
+		if !errors.Is(err, workspace.ErrPulumiCloudUnauthorized) {
+			return err
+		}
+
+		// ...If the request has 401'd AND we've identified the backend as being a Pulumi Cloud instance, we can
+		// attempt to retrieve the template using the user's Pulumi Cloud credentials.
+		repo, err = retrievePrivatePulumiCloudTemplate(args.templateNameOrURL)
+		if err != nil {
+			return fmt.Errorf("retrieving private pulumi cloud template: %w", err)
+		}
 	}
+
 	defer func() {
 		contract.IgnoreError(repo.Delete())
 	}()
@@ -471,6 +492,49 @@ func runNew(ctx context.Context, args newArgs) error {
 	return nil
 }
 
+// Retrieve a Private template from the given Pulumi Cloud URL **including an auth token for Pulumi Cloud**.
+//
+// workspace.GetAccount ensures the user has a valid session with the Pulumi Cloud backend.
+//   - If the user is not logged in, the login flow will be initiated.
+//   - If the user is not logged in and pulumi does not recognize the backend as a known workspace then
+//     the user will see an authentication error.
+func retrievePrivatePulumiCloudTemplate(templateURL string) (workspace.TemplateRepository, error) {
+	u, err := url.Parse(templateURL)
+	if err != nil {
+		return workspace.TemplateRepository{}, fmt.Errorf("parsing template URL: %w", err)
+	}
+	// Docs convention is to store the cloud URL with the protocol.
+	// e.g. `pulumi login https://api.pulumi.com` or `pulumi login https://api.acme.org`
+	templatePulumiCloudHost := "https://" + u.Host
+
+	account, err := workspace.GetAccount(templatePulumiCloudHost)
+	if err != nil {
+		return workspace.TemplateRepository{}, fmt.Errorf(
+			"looking up pulumi cloud backend %s: %w",
+			templatePulumiCloudHost,
+			err,
+		)
+	}
+
+	if account.AccessToken == "" {
+		return workspace.TemplateRepository{}, fmt.Errorf("no access token found for %s", templatePulumiCloudHost)
+	}
+
+	templateRepository, err := workspace.RetrieveZIPTemplates(templateURL, func(req *http.Request) {
+		req.Header.Set("Authorization", "token "+account.AccessToken)
+	})
+
+	if errors.Is(err, workspace.ErrPulumiCloudUnauthorized) {
+		return workspace.TemplateRepository{}, fmt.Errorf(
+			"unauthorized to access template at %s. You may not have access to this template or token may have expired",
+			templatePulumiCloudHost,
+		)
+	}
+
+	// Caller can handle other errors
+	return templateRepository, err
+}
+
 // isInteractive lets us force interactive mode for testing by setting PULUMI_TEST_INTERACTIVE.
 func isInteractive() bool {
 	test, ok := os.LookupEnv("PULUMI_TEST_INTERACTIVE")
@@ -531,6 +595,10 @@ func NewNewCmd() *cobra.Command {
 			"* `pulumi new https://bitbucket.org/<user>/<repo>`\n" +
 			"* `pulumi new https://github.com/<user>/<repo>`\n" +
 			"\n" +
+			"  Note: If the URL doesn't follow the usual scheme of the given host (e.g. for GitLab subprojects)\n" +
+			"        you can append `.git` to the repository to disambiguate and point to the correct repository.\n" +
+			"        For example `https://gitlab.com/<project>/<subproject>/<repository>.git`.\n" +
+			"\n" +
 			"To create the project from a branch of a specific source control location, pass the url to the branch, e.g.\n" +
 			"* `pulumi new https://gitlab.com/<user>/<repo>/tree/<branch>`\n" +
 			"* `pulumi new https://bitbucket.org/<user>/<repo>/tree/<branch>`\n" +
@@ -560,7 +628,7 @@ func NewNewCmd() *cobra.Command {
 					logging.Warningf("could not list templates: %v", err)
 					return err
 				}
-				available, _ := templatesToOptionArrayAndMap(templates, true)
+				available, _ := templatesToOptionArrayAndMap(templates)
 				fmt.Println("")
 				fmt.Println("Available Templates:")
 				for _, t := range available {
@@ -581,7 +649,10 @@ func NewNewCmd() *cobra.Command {
 		// Show default help.
 		defaultHelp(cmd, args)
 
-		templates, err := getTemplates(cmd.Context())
+		// You'd think you could use cmd.Context() here but cobra doesn't set context on the cmd even though
+		// the parent help command has it. If https://github.com/spf13/cobra/issues/2240 gets fixed we can
+		// change back to cmd.Context() here.
+		templates, err := getTemplates(context.Background())
 		if err != nil {
 			logging.Warningf("could not list templates: %v", err)
 			return

@@ -1,4 +1,4 @@
-// Copyright 2016-2024, Pulumi Corporation.
+// Copyright 2016-2025, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/stack"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
@@ -292,23 +293,23 @@ func TestStackEnvConfig(t *testing.T) {
 	}
 
 	mockSecretsManager := &secrets.MockSecretsManager{
-		EncrypterF: func() (config.Encrypter, error) {
+		EncrypterF: func() config.Encrypter {
 			encrypter := &secrets.MockEncrypter{EncryptValueF: func() string { return "ciphertext" }}
-			return encrypter, nil
+			return encrypter
 		},
-		DecrypterF: func() (config.Decrypter, error) {
+		DecrypterF: func() config.Decrypter {
 			decrypter := &secrets.MockDecrypter{
 				DecryptValueF: func() string {
 					return "plaintext"
 				},
-				BulkDecryptF: func() map[string]string {
-					return map[string]string{
-						"idontknow": "whatiamdoing",
+				BulkDecryptF: func() []string {
+					return []string{
+						"whatiamdoing",
 					}
 				},
 			}
 
-			return decrypter, nil
+			return decrypter
 		},
 	}
 
@@ -377,23 +378,23 @@ func TestCopyConfig(t *testing.T) {
 	}
 
 	mockSecretsManager := &secrets.MockSecretsManager{
-		EncrypterF: func() (config.Encrypter, error) {
+		EncrypterF: func() config.Encrypter {
 			encrypter := &secrets.MockEncrypter{EncryptValueF: func() string { return "ciphertext" }}
-			return encrypter, nil
+			return encrypter
 		},
-		DecrypterF: func() (config.Decrypter, error) {
+		DecrypterF: func() config.Decrypter {
 			decrypter := &secrets.MockDecrypter{
 				DecryptValueF: func() string {
 					return "plaintext"
 				},
-				BulkDecryptF: func() map[string]string {
-					return map[string]string{
-						"idontknow": "whatiamdoing",
+				BulkDecryptF: func() []string {
+					return []string{
+						"whatiamdoing",
 					}
 				},
 			}
 
-			return decrypter, nil
+			return decrypter
 		},
 	}
 
@@ -503,4 +504,154 @@ func TestOpenStackEnvError(t *testing.T) {
 
 	_, _, err = openStackEnv(context.Background(), stack, &projectStack)
 	assert.Error(t, err)
+}
+
+func TestParseConfigKey(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		input   string
+		path    bool
+		wantKey config.Key
+		wantErr string
+	}{
+		{
+			name:    "namespaced key",
+			input:   "mynamespace:mykey",
+			path:    false,
+			wantKey: config.MustMakeKey("mynamespace", "mykey"),
+		},
+		{
+			name:    "namespaced key old-style",
+			input:   "aws:config:region",
+			path:    false,
+			wantKey: config.MustMakeKey("aws", "region"),
+		},
+		{
+			name:    "path-like key",
+			input:   "mynamespace:mykey.segment1.segment2",
+			path:    false,
+			wantKey: config.MustMakeKey("mynamespace", "mykey.segment1.segment2"),
+		},
+		{
+			name:    "path key",
+			input:   "mynamespace:mykey.segment1.segment2",
+			path:    true,
+			wantKey: config.MustMakeKey("mynamespace", "mykey.segment1.segment2"),
+		},
+		{
+			name:    "path segments with colons",
+			input:   "mynamespace:mykey.segment1:suffix",
+			path:    true,
+			wantKey: config.MustMakeKey("mynamespace", "mykey.segment1:suffix"),
+		},
+		{
+			name:    "non-path segments with colons fail to parse",
+			input:   "mynamespace:mykey.segment1:suffix",
+			path:    false,
+			wantErr: "configuration keys should be of the form `<namespace>:<name>`",
+		},
+		{
+			name:    "path with invalid top-level segment",
+			input:   "mynamespace:subnamespace:mykey.segment1.segment2",
+			path:    true,
+			wantErr: "configuration keys should be of the form `<namespace>:<name>`",
+		},
+		{
+			name:    "invalid path with colon before bracket",
+			input:   "mynamespace:my:key[\"segment\"]",
+			path:    true,
+			wantErr: "configuration keys should be of the form `<namespace>:<name>`",
+		},
+		{
+			name:    "key paths",
+			input:   "mynamespace:mykey[\"segment1:suffix\"]",
+			path:    true,
+			wantKey: config.MustMakeKey("mynamespace", "mykey[\"segment1:suffix\"]"),
+		},
+		{
+			name:    "bracket as top-level path segment",
+			input:   "mynamespace:[\"foo\"]",
+			path:    true,
+			wantKey: config.MustMakeKey("mynamespace", "[\"foo\"]"),
+		},
+		{
+			name:    "invalid path",
+			input:   "mynamespace:.segment1",
+			path:    true,
+			wantKey: config.MustMakeKey("mynamespace", ".segment1"),
+		},
+		{
+			name:    "path with multiple brackets",
+			input:   "mynamespace:mykey[\"segment1\"][\"segment2\"]",
+			path:    true,
+			wantKey: config.MustMakeKey("mynamespace", "mykey[\"segment1\"][\"segment2\"]"),
+		},
+		{
+			name:    "empty segment in path",
+			input:   "mynamespace:mykey..segment",
+			path:    true,
+			wantKey: config.MustMakeKey("mynamespace", "mykey..segment"),
+		},
+		{
+			name:    "old-style key as non-path",
+			input:   "aws:config:region.value",
+			path:    false,
+			wantKey: config.MustMakeKey("aws", "region.value"),
+		},
+		{
+			name:    "no namespace uses project name",
+			input:   "mykey",
+			path:    false,
+			wantKey: config.MustMakeKey("test-project", "mykey"),
+		},
+		{
+			name:    "no namespace with path segments",
+			input:   "mykey.segment1.segment2",
+			path:    true,
+			wantKey: config.MustMakeKey("test-project", "mykey.segment1.segment2"),
+		},
+		{
+			name:    "no namespace with brackets",
+			input:   "mykey[\"segment1\"]",
+			path:    true,
+			wantKey: config.MustMakeKey("test-project", "mykey[\"segment1\"]"),
+		},
+		{
+			name:    "no namespace with colon in path segment",
+			input:   "mykey.segment:with:colons",
+			path:    true,
+			wantKey: config.MustMakeKey("test-project", "mykey.segment:with:colons"),
+		},
+		{
+			name:    "no namespace with colon in non-path fails",
+			input:   "mykey:with:colons",
+			path:    false,
+			wantErr: "configuration keys should be of the form `<namespace>:<name>`",
+		},
+	}
+
+	ws := &pkgWorkspace.MockContext{
+		ReadProjectF: func() (*workspace.Project, string, error) {
+			return &workspace.Project{
+				Name: "test-project",
+			}, "/test/path", nil
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ParseConfigKey(ws, tt.input, tt.path)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantKey, got)
+		})
+	}
 }

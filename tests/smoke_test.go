@@ -112,10 +112,14 @@ output name {
 func TestLanguageConvertSmoke(t *testing.T) {
 	t.Parallel()
 
-	for _, runtime := range Runtimes {
-		runtime := runtime
-		t.Run(runtime, func(t *testing.T) {
+	for _, rt := range Runtimes {
+		t.Run(rt, func(t *testing.T) {
 			t.Parallel()
+
+			// TODO[pulumi/pulumi#18451]: Reenable this test
+			if rt == "java" && runtime.GOOS == "windows" {
+				t.Skip("the java test is very flaky on windows")
+			}
 
 			e := ptesting.NewEnvironment(t)
 			defer deleteIfNotFailed(e)
@@ -128,7 +132,7 @@ func TestLanguageConvertSmoke(t *testing.T) {
 			e.RunCommand("pulumi", "login", "--cloud-url", e.LocalURL())
 			e.RunCommand(
 				"pulumi", "convert", "--strict",
-				"--language", Languages[runtime], "--from", "pcl", "--out", "out")
+				"--language", Languages[rt], "--from", "pcl", "--out", "out")
 			e.CWD = filepath.Join(e.RootPath, "out")
 			e.RunCommand("pulumi", "stack", "init", "test")
 
@@ -143,10 +147,14 @@ func TestLanguageConvertSmoke(t *testing.T) {
 func TestLanguageConvertLenientSmoke(t *testing.T) {
 	t.Parallel()
 
-	for _, runtime := range Runtimes {
-		runtime := runtime
-		t.Run(runtime, func(t *testing.T) {
+	for _, rt := range Runtimes {
+		t.Run(rt, func(t *testing.T) {
 			t.Parallel()
+
+			// TODO[pulumi/pulumi#18451]: Reenable this test
+			if rt == "java" && runtime.GOOS == "windows" {
+				t.Skip("the java test is very flaky on windows")
+			}
 
 			e := ptesting.NewEnvironment(t)
 			defer deleteIfNotFailed(e)
@@ -159,7 +167,7 @@ func TestLanguageConvertLenientSmoke(t *testing.T) {
 			e.RunCommand("pulumi", "login", "--cloud-url", e.LocalURL())
 			e.RunCommand(
 				"pulumi", "convert", "--generate-only",
-				"--language", Languages[runtime], "--from", "pcl", "--out", "out")
+				"--language", Languages[rt], "--from", "pcl", "--out", "out")
 			// We don't want care about running this program because it _will_ be incorrect.
 		})
 	}
@@ -738,7 +746,12 @@ func TestImportVersionSmoke(t *testing.T) {
 	e.CWD = projectDir
 
 	e.RunCommand("pulumi", "login", "--cloud-url", e.LocalURL())
-	e.RunCommand("pulumi", "new", "random-go", "--yes")
+
+	// Create a new go project based of the local random template
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	template := filepath.Join(cwd, "testdata", "random_go")
+	e.RunCommand("pulumi", "new", template, "--yes")
 
 	// Install the version of the random provider used by the template and another
 	e.RunCommand("pulumi", "plugin", "install", "resource", "random", "4.16.7")
@@ -769,7 +782,12 @@ func TestRefreshUpgradeWarning(t *testing.T) {
 	e.CWD = projectDir
 
 	e.RunCommand("pulumi", "login", "--cloud-url", e.LocalURL())
-	e.RunCommand("pulumi", "new", "random-go", "--yes")
+
+	// Create a new go project based of the local random template
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	template := filepath.Join(cwd, "testdata", "random_go")
+	e.RunCommand("pulumi", "new", template, "--yes")
 
 	// Assert that the current go.mod is on the 4.13.0 version
 	goMod, err := os.ReadFile(filepath.Join(projectDir, "go.mod"))
@@ -785,6 +803,204 @@ func TestRefreshUpgradeWarning(t *testing.T) {
 
 	// Run a refresh and check that the warning is shown
 	stdout, _ := e.RunCommand("pulumi", "refresh", "--yes")
-	assert.Contains(t, stdout, "refresh operation is using an older version of plugin 'random' "+
+	assert.Contains(t, stdout, "refresh operation is using an older version of package 'random' "+
 		"than the specified program version: 4.13.0 < 4.16.7")
+}
+
+// Test that the warning for upgrading and then running a destroy is shown.
+//
+//nolint:paralleltest // pulumi new is not parallel safe
+func TestDestroyUpgradeWarning(t *testing.T) {
+	e := ptesting.NewEnvironment(t)
+	defer deleteIfNotFailed(e)
+
+	// `new` wants to work in an empty directory but our use of local url means we have a
+	// ".pulumi" directory at root.
+	projectDir := filepath.Join(e.RootPath, "project")
+	err := os.Mkdir(projectDir, 0o700)
+	require.NoError(t, err)
+
+	e.CWD = projectDir
+
+	e.RunCommand("pulumi", "login", "--cloud-url", e.LocalURL())
+
+	// Create a new typescript project based of the local random template
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	template := filepath.Join(cwd, "testdata", "random_typescript")
+	e.RunCommand("pulumi", "new", template, "--yes")
+
+	// Use the 4.12 version of the provider
+	replaceStringInFile := func(file, pattern, replacement string) {
+		data, err := os.ReadFile(file)
+		require.NoError(t, err)
+		newData := strings.ReplaceAll(string(data), pattern, replacement)
+		err = os.WriteFile(file, []byte(newData), 0o600)
+		require.NoError(t, err)
+	}
+	replaceStringInFile(filepath.Join(projectDir, "package.json"),
+		"\"@pulumi/random\": \"^4.13.0\",",
+		"\"@pulumi/random\": \"4.12.0\",")
+	e.RunCommand("pulumi", "plugin", "install", "resource", "random", "4.12.0")
+	e.RunCommand("pulumi", "install")
+	e.RunCommand("pulumi", "up", "--yes")
+
+	// Update the provider to a new version
+	replaceStringInFile(filepath.Join(projectDir, "package.json"),
+		"\"@pulumi/random\": \"4.12.0\",",
+		"\"@pulumi/random\": \"4.13.0\",")
+	e.RunCommand("pulumi", "plugin", "install", "resource", "random", "4.13.0")
+	e.RunCommand("pulumi", "install")
+
+	// Run a destroy and check that the warning is shown
+	stdout, _ := e.RunCommand("pulumi", "destroy", "--yes")
+	assert.Contains(t, stdout, "destroy operation is using an older version of package 'random' "+
+		"than the specified program version: 4.12.0 < 4.13.0")
+}
+
+// Test that the warning for upgrading and then running a destroy is shown, also taking into account changes to
+// parameterized packages.
+//
+//nolint:paralleltest // pulumi new is not parallel safe
+func TestDestroyUpgradeWarningParameterized(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Very flakey on Windows https://github.com/pulumi/pulumi/issues/18414")
+	}
+	e := ptesting.NewEnvironment(t)
+	defer deleteIfNotFailed(e)
+
+	// `new` wants to work in an empty directory but our use of local url means we have a
+	// ".pulumi" directory at root.
+	projectDir := filepath.Join(e.RootPath, "project")
+	err := os.Mkdir(projectDir, 0o700)
+	require.NoError(t, err)
+
+	e.CWD = projectDir
+
+	e.RunCommand("pulumi", "login", "--cloud-url", e.LocalURL())
+
+	// Create a new typescript project based of the local random template
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	template := filepath.Join(cwd, "testdata", "random_typescript")
+	e.RunCommand("pulumi", "new", template, "--yes")
+
+	// Change to use the parameterised version of the provider
+	e.RunCommand("pulumi", "plugin", "install", "resource", "terraform-provider", "0.3.1")
+	e.RunCommand("pulumi", "package", "add", "terraform-provider", "hashicorp/random", "3.6.0")
+	replaceStringInFile := func(file, pattern, replacement string) {
+		data, err := os.ReadFile(file)
+		require.NoError(t, err)
+		newData := strings.ReplaceAll(string(data), pattern, replacement)
+		err = os.WriteFile(file, []byte(newData), 0o600)
+		require.NoError(t, err)
+	}
+	replaceStringInFile(filepath.Join(projectDir, "package.json"), "\"@pulumi/random\": \"^4.13.0\",", "")
+	replaceStringInFile(filepath.Join(projectDir, "index.ts"), "RandomPet", "Pet")
+	e.RunCommand("pulumi", "install")
+
+	e.RunCommand("pulumi", "up", "--yes")
+
+	// Update the provider to a new version
+	e.RunCommand("pulumi", "package", "add", "terraform-provider", "hashicorp/random", "3.6.3")
+
+	// Run a destroy and check that the warning is shown
+	stdout, _ := e.RunCommand("pulumi", "destroy", "--yes")
+	assert.Contains(t, stdout, "destroy operation is using an older version of package 'random' "+
+		"than the specified program version: 3.6.0 < 3.6.3")
+}
+
+func testImportParameterizedSmoke(t *testing.T, withUp bool) {
+	e := ptesting.NewEnvironment(t)
+	defer deleteIfNotFailed(e)
+
+	// `new` wants to work in an empty directory but our use of local url means we have a
+	// ".pulumi" directory at root.
+	projectDir := filepath.Join(e.RootPath, "project")
+	err := os.Mkdir(projectDir, 0o700)
+	require.NoError(t, err)
+
+	e.CWD = projectDir
+
+	e.RunCommand("pulumi", "login", "--cloud-url", e.LocalURL())
+
+	// Create a new python project based of the local random template
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	template := filepath.Join(cwd, "testdata", "random_python")
+	e.RunCommand("pulumi", "new", template, "--yes")
+
+	// Change to use the parameterised version of the provider
+	e.RunCommand("pulumi", "plugin", "install", "resource", "terraform-provider", "0.3.1")
+	replaceStringInFile := func(file, pattern, replacement string) {
+		data, err := os.ReadFile(file)
+		require.NoError(t, err)
+		newData := strings.ReplaceAll(string(data), pattern, replacement)
+		err = os.WriteFile(file, []byte(newData), 0o600)
+		require.NoError(t, err)
+	}
+	replaceStringInFile(filepath.Join(projectDir, "requirements.txt"), "pulumi-random>=4.0.0,<5.0.0", "")
+	e.RunCommand("pulumi", "package", "add", "terraform-provider", "hashicorp/random", "3.6.3")
+	replaceStringInFile(filepath.Join(projectDir, "__main__.py"), "RandomPet", "Pet")
+	e.RunCommand("pulumi", "install")
+
+	if withUp {
+		e.RunCommand("pulumi", "up", "--yes")
+	}
+
+	// Now try and import a random resource. This should use the project's currently known packages to help choose the
+	// right provider. "random" alone isn't enough to know to use the parameterized provider -- normally, it would use the
+	// github.com/pulumi/pulumi-random bridged version. For packages that aren't bridged this would result would result in
+	// an error (e.g. https://github.com/pulumi/pulumi/issues/17289)
+	stdout, _ := e.RunCommand("pulumi", "import", "--yes", "random:index/id:Id", "identifier", "p-9hUg")
+	// Check it wrote out the expected Python code.
+	assert.Contains(t, stdout, "identifier = random.Id(\"identifier\"")
+
+	// Check this used the right provider, i.e. one with parameterization
+	stack, _ := e.RunCommand("pulumi", "stack", "export")
+	var state map[string]interface{}
+	err = json.Unmarshal([]byte(stack), &state)
+	require.NoError(t, err)
+
+	resources := state["deployment"].(map[string]interface{})["resources"].([]interface{})
+
+	var resource map[string]interface{}
+	var provider map[string]interface{}
+	for _, res := range resources {
+		res := res.(map[string]interface{})
+		if res["type"] == "random:index/id:Id" {
+			assert.Nil(t, resource) // only expect one
+			resource = res
+		}
+		if res["type"] == "pulumi:providers:random" {
+			assert.Nil(t, provider) // only expect one
+			provider = res
+		}
+	}
+	require.NotNil(t, resource)
+	require.NotNil(t, provider)
+
+	inputs := provider["inputs"].(map[string]interface{})
+	assert.Equal(t, "3.6.3", inputs["version"])
+	ref := provider["urn"].(string) + "::" + provider["id"].(string)
+
+	assert.Equal(t, "p-9hUg", resource["id"])
+	assert.Equal(t, ref, resource["provider"])
+}
+
+// Quick sanity tests to check that import for a parameterized package works. This uses python as the language choice
+// shouldn't matter for the test. Regression test for https://github.com/pulumi/pulumi/issues/17289.
+//
+//nolint:paralleltest // pulumi new is not parallel safe
+func TestImportParameterizedSmoke(t *testing.T) {
+	testImportParameterizedSmoke(t, true)
+}
+
+// Quick sanity tests to check that import for a parameterized package works when there's no existing state. This uses
+// python as the language choice shouldn't matter for the test. Regression test for
+// https://github.com/pulumi/pulumi/issues/18449.
+//
+//nolint:paralleltest // pulumi new is not parallel safe
+func TestImportParameterizedSmokeFreshState(t *testing.T) {
+	testImportParameterizedSmoke(t, false)
 }

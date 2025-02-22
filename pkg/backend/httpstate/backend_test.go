@@ -45,7 +45,7 @@ func TestEnabledFullyQualifiedStackNames(t *testing.T) {
 	_, err := NewLoginManager().Login(ctx, PulumiCloudURL, false, "", "", nil, true, display.Options{})
 	require.NoError(t, err)
 
-	b, err := New(diagtest.LogSink(t), PulumiCloudURL, &workspace.Project{Name: "testproj"}, false)
+	b, err := New(ctx, diagtest.LogSink(t), PulumiCloudURL, &workspace.Project{Name: "testproj"}, false)
 	require.NoError(t, err)
 
 	stackName := ptesting.RandomStackName()
@@ -54,6 +54,10 @@ func TestEnabledFullyQualifiedStackNames(t *testing.T) {
 
 	s, err := b.CreateStack(ctx, ref, "", nil, nil)
 	require.NoError(t, err)
+	defer func() {
+		_, err := b.RemoveStack(ctx, s, true)
+		require.NoError(t, err)
+	}()
 
 	previous := cmdutil.FullyQualifyStackNames
 	expected := s.Ref().FullyQualifiedName().String()
@@ -80,7 +84,7 @@ func TestDisabledFullyQualifiedStackNames(t *testing.T) {
 	_, err := NewLoginManager().Login(ctx, PulumiCloudURL, false, "", "", nil, true, display.Options{})
 	require.NoError(t, err)
 
-	b, err := New(diagtest.LogSink(t), PulumiCloudURL, &workspace.Project{Name: "testproj"}, false)
+	b, err := New(ctx, diagtest.LogSink(t), PulumiCloudURL, &workspace.Project{Name: "testproj"}, false)
 	require.NoError(t, err)
 
 	stackName := ptesting.RandomStackName()
@@ -89,6 +93,10 @@ func TestDisabledFullyQualifiedStackNames(t *testing.T) {
 
 	s, err := b.CreateStack(ctx, ref, "", nil, nil)
 	require.NoError(t, err)
+	defer func() {
+		_, err := b.RemoveStack(ctx, s, true)
+		require.NoError(t, err)
+	}()
 
 	previous := cmdutil.FullyQualifyStackNames
 	expected := s.Ref().Name().String()
@@ -236,7 +244,7 @@ func TestDisableIntegrityChecking(t *testing.T) {
 	_, err := NewLoginManager().Login(ctx, PulumiCloudURL, false, "", "", nil, true, display.Options{})
 	require.NoError(t, err)
 
-	b, err := New(diagtest.LogSink(t), PulumiCloudURL, &workspace.Project{Name: "testproj"}, false)
+	b, err := New(ctx, diagtest.LogSink(t), PulumiCloudURL, &workspace.Project{Name: "testproj"}, false)
 	require.NoError(t, err)
 
 	stackName := ptesting.RandomStackName()
@@ -245,6 +253,10 @@ func TestDisableIntegrityChecking(t *testing.T) {
 
 	s, err := b.CreateStack(ctx, ref, "", nil, nil)
 	require.NoError(t, err)
+	defer func() {
+		_, err := b.RemoveStack(ctx, s, true)
+		require.NoError(t, err)
+	}()
 
 	// make up a bad stack
 	deployment := apitype.UntypedDeployment{

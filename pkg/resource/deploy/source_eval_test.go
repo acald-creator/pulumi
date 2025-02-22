@@ -1602,7 +1602,7 @@ func TestStreamInvoke(t *testing.T) {
 			nil, "", nil, false, nil)
 		assert.NoError(t, err)
 
-		builtins := newBuiltinProvider(&deploytest.BackendClient{}, nil, plugctx.Diag)
+		builtins := newBuiltinProvider(&deploytest.BackendClient{}, nil, nil, plugctx.Diag)
 		reg := providers.NewRegistry(plugctx.Host, false, builtins)
 		providerRegChan := make(chan *registerResourceEvent, 100)
 		mon, err := newResourceMonitor(&evalSource{
@@ -1685,7 +1685,7 @@ func TestStreamInvokeQuery(t *testing.T) {
 
 		cancel := context.Background()
 
-		builtins := newBuiltinProvider(&deploytest.BackendClient{}, nil, plugctx.Diag)
+		builtins := newBuiltinProvider(&deploytest.BackendClient{}, nil, nil, plugctx.Diag)
 
 		reg := providers.NewRegistry(plugctx.Host, false, builtins)
 
@@ -1749,7 +1749,7 @@ func TestStreamInvokeQuery(t *testing.T) {
 
 		cancel := context.Background()
 
-		builtins := newBuiltinProvider(&deploytest.BackendClient{}, nil, plugctx.Diag)
+		builtins := newBuiltinProvider(&deploytest.BackendClient{}, nil, nil, plugctx.Diag)
 
 		reg := providers.NewRegistry(plugctx.Host, false, builtins)
 		providerRegErrChan := make(chan error)
@@ -1777,7 +1777,7 @@ type decrypterMock struct {
 	DecryptValueF func(
 		ctx context.Context, ciphertext string) (string, error)
 	BulkDecryptF func(
-		ctx context.Context, ciphertexts []string) (map[string]string, error)
+		ctx context.Context, ciphertexts []string) ([]string, error)
 }
 
 var _ config.Decrypter = (*decrypterMock)(nil)
@@ -1789,7 +1789,7 @@ func (d *decrypterMock) DecryptValue(ctx context.Context, ciphertext string) (st
 	panic("unimplemented")
 }
 
-func (d *decrypterMock) BulkDecrypt(ctx context.Context, ciphertexts []string) (map[string]string, error) {
+func (d *decrypterMock) BulkDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
 	if d.BulkDecryptF != nil {
 		return d.BulkDecryptF(ctx, ciphertexts)
 	}
@@ -1809,18 +1809,6 @@ func TestEvalSource(t *testing.T) {
 			},
 		}
 		assert.Equal(t, tokens.MustParseStackName("target-name"), src.Stack())
-	})
-	t.Run("Info", func(t *testing.T) {
-		t.Parallel()
-		runinfo := &EvalRunInfo{
-			Target: &Target{
-				Name: tokens.MustParseStackName("target-name"),
-			},
-		}
-		src := &evalSource{
-			runinfo: runinfo,
-		}
-		assert.Equal(t, runinfo, src.Info())
 	})
 	t.Run("Iterate", func(t *testing.T) {
 		t.Parallel()
@@ -2076,11 +2064,13 @@ func TestDefaultProviders(t *testing.T) {
 			t.Parallel()
 			v1 := semver.MustParse("0.1.0")
 			d := &defaultProviders{
-				defaultProviderInfo: map[tokens.Package]workspace.PluginSpec{
+				defaultProviderInfo: map[tokens.Package]workspace.PackageDescriptor{
 					tokens.Package("pkg"): {
-						Version:           &v1,
-						PluginDownloadURL: "github://owner/repo",
-						Checksums:         map[string][]byte{"key": []byte("expected-checksum-value")},
+						PluginSpec: workspace.PluginSpec{
+							Version:           &v1,
+							PluginDownloadURL: "github://owner/repo",
+							Checksums:         map[string][]byte{"key": []byte("expected-checksum-value")},
+						},
 					},
 				},
 				config: &configSourceMock{
@@ -3082,7 +3072,7 @@ func TestRegisterResource(t *testing.T) {
 		t.Parallel()
 		rm := &resmon{
 			defaultProviders: &defaultProviders{
-				defaultProviderInfo: map[tokens.Package]workspace.PluginSpec{},
+				defaultProviderInfo: map[tokens.Package]workspace.PackageDescriptor{},
 			},
 		}
 		req := &pulumirpc.RegisterResourceRequest{

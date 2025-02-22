@@ -96,7 +96,7 @@ type EvalSourceOptions struct {
 func NewEvalSource(
 	plugctx *plugin.Context,
 	runinfo *EvalRunInfo,
-	defaultProviderInfo map[tokens.Package]workspace.PluginSpec,
+	defaultProviderInfo map[tokens.Package]workspace.PackageDescriptor,
 	opts EvalSourceOptions,
 ) Source {
 	return &evalSource{
@@ -108,10 +108,10 @@ func NewEvalSource(
 }
 
 type evalSource struct {
-	plugctx             *plugin.Context                         // the plugin context.
-	runinfo             *EvalRunInfo                            // the directives to use when running the program.
-	defaultProviderInfo map[tokens.Package]workspace.PluginSpec // the default provider versions for this source.
-	opts                EvalSourceOptions                       // options for the evaluation source.
+	plugctx             *plugin.Context                                // the plugin context.
+	runinfo             *EvalRunInfo                                   // the directives to use when running the program.
+	defaultProviderInfo map[tokens.Package]workspace.PackageDescriptor // the default provider versions for this source.
+	opts                EvalSourceOptions                              // options for the evaluation source.
 }
 
 func (src *evalSource) Close() error {
@@ -127,8 +127,6 @@ func (src *evalSource) Project() tokens.PackageName {
 func (src *evalSource) Stack() tokens.StackName {
 	return src.runinfo.Target.Name
 }
-
-func (src *evalSource) Info() interface{} { return src.runinfo }
 
 // Iterate will spawn an evaluator coroutine and prepare to interact with it on subsequent calls to Next.
 func (src *evalSource) Iterate(ctx context.Context, providers ProviderSource) (SourceIterator, error) {
@@ -320,7 +318,7 @@ func (iter *evalSourceIterator) forkRun(
 type defaultProviders struct {
 	// A map of package identifiers to versions, used to disambiguate which plugin to load if no version is provided
 	// by the language host.
-	defaultProviderInfo map[tokens.Package]workspace.PluginSpec
+	defaultProviderInfo map[tokens.Package]workspace.PackageDescriptor
 
 	// A map of ProviderRequest strings to provider references, used to keep track of the set of default providers that
 	// have already been loaded.
@@ -397,21 +395,19 @@ func (d *defaultProviders) normalizeProviderRequest(req providers.ProviderReques
 	}
 
 	if req.Parameterization() != nil {
-		logging.V(5).Infof("normalizeProviderRequest(%s): default parameterization miss, sending nil to engine", req)
-	} else {
 		logging.V(5).Infof("normalizeProviderRequest(%s): using parameterization %v from request",
 			req, req.Parameterization())
+	} else {
+		if parameterization := d.defaultProviderInfo[req.Package()].Parameterization; parameterization != nil {
+			logging.V(5).Infof("normalizeProviderRequest(%s): default parameterization hit on %v",
+				req, parameterization)
 
-		// TODO: Should Parameterization be in defaultProviderInfo
-		//if parameterization := d.defaultProviderInfo[req.Package()].Parameterization; parameterization != nil {
-		//	logging.V(5).Infof("normalizeProviderRequest(%s): default parameterization hit on %v",
-		//		req, parameterization)
-		//	req = providers.NewProviderRequest(
-		//  	req.Version(), req.Package(), req.PluginDownloadURL(), req.PluginChecksums(), parameterization)
-		//} else {
-		//	logging.V(5).Infof(
-		//		"normalizeProviderRequest(%s): default parameterization miss, sending nil to engine", req)
-		//}
+			req = providers.NewProviderRequest(
+				req.Package(), req.Version(), req.PluginDownloadURL(), req.PluginChecksums(), parameterization)
+		} else {
+			logging.V(5).Infof(
+				"normalizeProviderRequest(%s): default parameterization miss, sending nil to engine", req)
+		}
 	}
 
 	return req
@@ -859,7 +855,7 @@ func (rm *resmon) getProviderFromSource(
 func parseProviderRequest(
 	pkg tokens.Package, version,
 	pluginDownloadURL string, pluginChecksums map[string][]byte,
-	parameterization *providers.ProviderParameterization,
+	parameterization *workspace.Parameterization,
 ) (providers.ProviderRequest, error) {
 	if version == "" {
 		logging.V(5).Infof("parseProviderRequest(%s): semver version is the empty string", pkg)
@@ -897,7 +893,7 @@ func (rm *resmon) RegisterPackage(ctx context.Context,
 		version = &v
 	}
 	// Parse the parameterization
-	var parameterization *providers.ProviderParameterization
+	var parameterization *workspace.Parameterization
 	if req.Parameterization != nil {
 		parameterizationVersion, err := semver.Parse(req.Parameterization.Version)
 		if err != nil {
@@ -907,11 +903,11 @@ func (rm *resmon) RegisterPackage(ctx context.Context,
 		// RegisterPackageRequest keeps all the plugin information in the root fields "name", "version" etc, while the
 		// information about the parameterized package is in the "parameterization" field. Internally in the engine, and
 		// for resource state we need to flip that around a bit.
-		parameterization = providers.NewProviderParameterization(
-			tokens.Package(req.Parameterization.Name),
-			parameterizationVersion,
-			req.Parameterization.Value,
-		)
+		parameterization = &workspace.Parameterization{
+			Name:    req.Parameterization.Name,
+			Version: parameterizationVersion,
+			Value:   req.Parameterization.Value,
+		}
 	}
 
 	pi := providers.NewProviderRequest(
@@ -1432,6 +1428,7 @@ func (rm *resmon) wrapTransformCallback(cb *pulumirpc.Callback) (TransformFuncti
 		request, err := proto.Marshal(&pulumirpc.TransformRequest{
 			Name:       name,
 			Type:       typ,
+			Parent:     string(parent),
 			Custom:     custom,
 			Properties: mprops,
 			Options:    opts,

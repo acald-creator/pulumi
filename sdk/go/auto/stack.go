@@ -370,7 +370,6 @@ func (s *Stack) Up(ctx context.Context, opts ...optup.Option) (UpResult, error) 
 	bufferSizeHint := len(upOpts.Replace) + len(upOpts.Target) + len(upOpts.PolicyPacks) + len(upOpts.PolicyPackConfigs)
 	sharedArgs := slice.Prealloc[string](bufferSizeHint)
 
-	sharedArgs = debug.AddArgs(&upOpts.DebugLogOpts, sharedArgs)
 	if upOpts.Message != "" {
 		sharedArgs = append(sharedArgs, fmt.Sprintf("--message=%q", upOpts.Message))
 	}
@@ -430,6 +429,8 @@ func (s *Stack) Up(ctx context.Context, opts ...optup.Option) (UpResult, error) 
 	sharedArgs = append(sharedArgs, s.remoteArgs()...)
 
 	kind, args := constant.ExecKindAutoLocal, []string{"up", "--yes", "--skip-preview"}
+	args = debug.AddArgs(&upOpts.DebugLogOpts, args)
+
 	if program := s.Workspace().Program(); program != nil {
 		server, err := startLanguageRuntimeServer(program)
 		if err != nil {
@@ -505,7 +506,17 @@ func (s *Stack) ImportResources(ctx context.Context, opts ...optimport.Option) (
 	// clean-up the temp directory after we are done
 	defer os.RemoveAll(tempDir)
 
-	args := []string{"import", "--yes", "--skip-preview"}
+	args := []string{"import"}
+
+	if importOpts.PreviewOnly != nil && *importOpts.PreviewOnly {
+		args = append(args, "--preview-only")
+	} else {
+		args = append(args, "--yes", "--skip-preview")
+	}
+
+	if importOpts.Diff != nil && *importOpts.Diff {
+		args = append(args, "--diff")
+	}
 
 	if importOpts.Resources != nil {
 		importFilePath := filepath.Join(tempDir, "import.json")
@@ -527,6 +538,10 @@ func (s *Stack) ImportResources(ctx context.Context, opts ...optimport.Option) (
 		}
 
 		args = append(args, "--file", importFilePath)
+	}
+
+	if importOpts.Resources == nil && importOpts.ImportFile != nil {
+		args = append(args, "--file", *importOpts.ImportFile)
 	}
 
 	if importOpts.Protect != nil && !*importOpts.Protect {
@@ -720,8 +735,8 @@ func (s *Stack) Refresh(ctx context.Context, opts ...optrefresh.Option) (Refresh
 func refreshOptsToCmd(o *optrefresh.Options, s *Stack, isPreview bool) []string {
 	args := slice.Prealloc[string](len(o.Target))
 
-	args = debug.AddArgs(&o.DebugLogOpts, args)
 	args = append(args, "refresh")
+	args = debug.AddArgs(&o.DebugLogOpts, args)
 	if isPreview {
 		args = append(args, "--preview-only")
 	} else {
@@ -732,6 +747,9 @@ func refreshOptsToCmd(o *optrefresh.Options, s *Stack, isPreview bool) []string 
 	}
 	if o.ExpectNoChanges {
 		args = append(args, "--expect-no-changes")
+	}
+	if o.ClearPendingCreates {
+		args = append(args, "--clear-pending-creates")
 	}
 	for _, tURN := range o.Target {
 		args = append(args, "--target="+tURN)

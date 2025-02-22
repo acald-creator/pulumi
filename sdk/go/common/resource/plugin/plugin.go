@@ -278,7 +278,8 @@ func newPlugin[T any](
 
 	// For now, we will spawn goroutines that will spew STDOUT/STDERR to the relevant diag streams.
 	var sawPolicyModuleNotFoundErr bool
-	if kind == apitype.ResourcePlugin {
+	if kind == apitype.ResourcePlugin && !isDynamicPluginBinary(bin) {
+		logging.Infof("Hiding logs from %q:%q", prefix, bin)
 		plug.unstructuredOutput = &unstructuredOutput{diag: ctx.Diag}
 	}
 	runtrace := func(t io.Reader, streamID streamID, done chan<- bool) {
@@ -554,11 +555,13 @@ func buildPluginArguments(opts pluginArgumentOptions) []string {
 }
 
 func (p *plugin) Close() error {
-	// Something has gone wrong with the plugin if it is not ready to handle requests
-	// and we have not yet shut it down.
-	pluginCrashed := p.Conn.GetState() != connectivity.Ready
+	pluginCrashed := true
 
 	if p.Conn != nil {
+		// Something has gone wrong with the plugin if it is not ready to handle requests and we have not yet
+		// shut it down.
+		pluginCrashed = p.Conn.GetState() != connectivity.Ready
+
 		contract.IgnoreClose(p.Conn)
 	}
 
@@ -602,4 +605,9 @@ func (p *plugin) Close() error {
 	}
 
 	return result
+}
+
+func isDynamicPluginBinary(path string) bool {
+	return strings.HasSuffix(path, "pulumi-resource-pulumi-nodejs") ||
+		strings.HasSuffix(path, "pulumi-resource-pulumi-python")
 }

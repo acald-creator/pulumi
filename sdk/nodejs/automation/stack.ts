@@ -440,8 +440,9 @@ Event: ${line}\n${e.toString()}`);
      *  Options to customize the behavior of the refresh.
      */
     async refresh(opts?: RefreshOptions): Promise<RefreshResult> {
-        const args = ["refresh", "--yes", "--skip-preview"];
+        const args = ["refresh", "--yes"];
 
+        args.push(opts?.previewOnly ? "--preview-only" : "--skip-preview");
         args.push(...this.remoteArgs());
 
         if (opts) {
@@ -450,6 +451,9 @@ Event: ${line}\n${e.toString()}`);
             }
             if (opts.expectNoChanges) {
                 args.push("--expect-no-changes");
+            }
+            if (opts.clearPendingCreates) {
+                args.push("--clear-pending-creates");
             }
             if (opts.target) {
                 for (const tURN of opts.target) {
@@ -1451,9 +1455,19 @@ export interface RefreshOptions extends GlobalOpts {
     message?: string;
 
     /**
+     * Only show a preview of the refresh, but don't perform the refresh itself.
+     */
+    previewOnly?: boolean;
+
+    /**
      * Return an error if any changes occur during this operation.
      */
     expectNoChanges?: boolean;
+
+    /**
+     * Clear all pending creates, dropping them from the state
+     */
+    clearPendingCreates?: boolean;
 
     /**
      * Specify a set of resource URNs to operate on. Other resources will not be updated.

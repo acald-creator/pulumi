@@ -18,10 +18,10 @@ include ../../build/common.mk
 
 export PATH:=$(shell yarn bin 2>/dev/null):$(PATH)
 
-ensure:: yarn.ensure node.ensure .ensure.phony
-.ensure.phony: package.json
+ensure:: .make/ensure/yarn .make/ensure/node .make/ensure/phony
+.make/ensure/phony: package.json
 	yarn install --frozen-lockfile
-	@touch .ensure.phony
+	@mkdir -p .make/ensure && touch .make/ensure/phony
 
 format:: ensure
 	yarn biome format --write .
@@ -38,6 +38,7 @@ build_package:: ensure
 	yarn run tsc
 	mkdir -p bin/tests/automation/data/
 	cp -R tests/automation/data/. bin/tests/automation/data/
+	cp -R tests/provider/experimental/testdata/ bin/tests/provider/experimental/testdata
 	cp .npmignore README.md ../../LICENSE ./dist/* bin/
 	cp -R ./vendor/ ./bin/vendor/
 	node ../../scripts/reversion.js bin/package.json ${VERSION}

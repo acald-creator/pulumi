@@ -886,13 +886,8 @@ func TestContinueOnErrorWithChangingProviderOnCreate(t *testing.T) {
 	programF := deploytest.NewLanguageRuntimeF(func(_ plugin.RunInfo, monitor *deploytest.ResourceMonitor) error {
 		resp, err := monitor.RegisterResource(providers.MakeProviderType("pkgA"), "provA", true)
 		assert.NoError(t, err)
-		provID := resp.ID
 
-		if provID == "" {
-			provID = providers.UnknownID
-		}
-
-		provRef, err := providers.NewReference(resp.URN, provID)
+		provRef, err := providers.NewReference(resp.URN, resp.ID)
 		assert.NoError(t, err)
 
 		_, err = monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{
@@ -925,6 +920,10 @@ func TestContinueOnErrorWithChangingProviderOnCreate(t *testing.T) {
 				CreateF: func(_ context.Context, req plugin.CreateRequest) (plugin.CreateResponse, error) {
 					return plugin.CreateResponse{}, errors.New("interrupt replace")
 				},
+				DiffConfigF: func(_ context.Context, _ plugin.DiffConfigRequest) (plugin.DiffConfigResponse, error) {
+					// Always report a replace diff to trigger a replacement
+					return plugin.DiffConfigResponse{Changes: plugin.DiffSome, ReplaceKeys: []resource.PropertyKey{"version"}}, nil
+				},
 			}, nil
 		}),
 	}
@@ -934,13 +933,8 @@ func TestContinueOnErrorWithChangingProviderOnCreate(t *testing.T) {
 			Version: "2.0.0",
 		})
 		assert.NoError(t, err)
-		provID := resp.ID
 
-		if provID == "" {
-			provID = providers.UnknownID
-		}
-
-		provRef, err := providers.NewReference(resp.URN, provID)
+		provRef, err := providers.NewReference(resp.URN, resp.ID)
 		assert.NoError(t, err)
 
 		_, err = monitor.RegisterResource("pkgA:m:typA", "resA", true, deploytest.ResourceOptions{

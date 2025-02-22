@@ -178,6 +178,12 @@ type UpdateOptions struct {
 
 	// Autonamer can resolve user's preference for custom autonaming options for a given resource.
 	Autonamer autonaming.Autonamer
+
+	// The execution kind of the operation.
+	ExecKind string
+
+	// ShowSecrets is true if the engine should display secrets in the CLI.
+	ShowSecrets bool
 }
 
 // HasChanges returns true if there are any non-same changes in the resulting summary.
@@ -199,7 +205,6 @@ func Update(u UpdateInfo, ctx *Context, opts UpdateOptions, dryRun bool) (
 ) {
 	contract.Requiref(u != nil, "update", "cannot be nil")
 	contract.Requiref(ctx != nil, "ctx", "cannot be nil")
-
 	defer func() { ctx.Events <- NewCancelEvent() }()
 
 	info, err := newDeploymentContext(u, "update", ctx.ParentSpan)
@@ -233,7 +238,7 @@ func installPlugins(
 	ctx context.Context,
 	proj *workspace.Project, pwd, main string, target *deploy.Target, opts *deploymentOptions,
 	plugctx *plugin.Context, returnInstallErrors bool,
-) (PluginSet, map[tokens.Package]workspace.PluginSpec, error) {
+) (PluginSet, map[tokens.Package]workspace.PackageDescriptor, error) {
 	// Before launching the source, ensure that we have all of the plugins that we need in order to proceed.
 	//
 	// There are two places that we need to look for plugins:
@@ -253,23 +258,24 @@ func installPlugins(
 		/* entryPoint */ main,
 		/* options */ proj.Runtime.Options(),
 	)
-	languagePlugins, err := gatherPluginsFromProgram(plugctx, runtime, programInfo)
+	languagePackages, err := gatherPackagesFromProgram(plugctx, runtime, programInfo)
 	if err != nil {
 		return nil, nil, err
 	}
-	snapshotPlugins, err := gatherPluginsFromSnapshot(plugctx, target)
+	snapshotPackages, err := gatherPackagesFromSnapshot(plugctx, target)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	allPlugins := languagePlugins.Union(snapshotPlugins)
+	allPackages := languagePackages.Union(snapshotPackages)
+	allPlugins := allPackages.ToPluginSet().Deduplicate()
 
 	// If there are any plugins that are not available, we can attempt to install them here.
 	//
 	// Note that this is purely a best-effort thing. If we can't install missing plugins, just proceed; we'll fail later
 	// with an error message indicating exactly what plugins are missing. If `returnInstallErrors` is set, then return
 	// the error.
-	if err := EnsurePluginsAreInstalled(ctx, opts, plugctx.Diag, allPlugins.Deduplicate(),
+	if err := EnsurePluginsAreInstalled(ctx, opts, plugctx.Diag, allPlugins,
 		plugctx.Host.GetProjectPlugins(), false /*reinstall*/, false /*explicitInstall*/); err != nil {
 		if returnInstallErrors {
 			return nil, nil, err
@@ -278,7 +284,7 @@ func installPlugins(
 	}
 
 	// Collect the version information for default providers.
-	defaultProviderVersions := computeDefaultProviderPlugins(languagePlugins, allPlugins)
+	defaultProviderVersions := computeDefaultProviderPackages(languagePackages, allPackages)
 
 	return allPlugins, defaultProviderVersions, nil
 }
@@ -581,8 +587,12 @@ func (acts *updateActions) OnResourceStepPre(step deploy.Step) (interface{}, err
 	acts.MapLock.Lock()
 	acts.Seen[step.URN()] = step
 	acts.MapLock.Unlock()
-
-	acts.Opts.Events.resourcePreEvent(step, false /*planning*/, acts.Opts.Debug, isInternalStep(step))
+	acts.Opts.Events.resourcePreEvent(step,
+		false, /*planning*/
+		acts.Opts.Debug,
+		isInternalStep(step),
+		acts.Opts.ShowSecrets,
+	)
 
 	// Inform the snapshot service that we are about to perform a step.
 	return acts.Context.SnapshotManager.BeginMutation(step)
@@ -617,7 +627,7 @@ func (acts *updateActions) OnResourceStepPost(
 
 		// Issue a true, bonafide error.
 		acts.Opts.Diag.Errorf(diag.GetResourceOperationFailedError(errorURN), err)
-		acts.Opts.Events.resourceOperationFailedEvent(step, status, acts.Steps, acts.Opts.Debug)
+		acts.Opts.Events.resourceOperationFailedEvent(step, status, acts.Steps, acts.Opts.Debug, acts.Opts.ShowSecrets)
 	} else {
 		op, record := step.Op(), step.Logical()
 		if acts.Opts.isRefresh && op == deploy.OpRefresh {
@@ -642,7 +652,14 @@ func (acts *updateActions) OnResourceStepPost(
 		// the Pulumi program, as component resources only report outputs via calls to RegisterResourceOutputs.
 		// Deletions emit the resourceOutputEvent so the display knows when to stop the time elapsed counter.
 		if step.Res().Custom || acts.Opts.Refresh && step.Op() == deploy.OpRefresh || step.Op() == deploy.OpDelete {
-			acts.Opts.Events.resourceOutputsEvent(op, step, false /*planning*/, acts.Opts.Debug, isInternalStep)
+			acts.Opts.Events.resourceOutputsEvent(
+				op,
+				step,
+				false, /*planning*/
+				acts.Opts.Debug,
+				isInternalStep,
+				acts.Opts.ShowSecrets,
+			)
 		}
 	}
 
@@ -683,7 +700,14 @@ func (acts *updateActions) OnResourceOutputs(step deploy.Step) error {
 	assertSeen(acts.Seen, step)
 	acts.MapLock.Unlock()
 
-	acts.Opts.Events.resourceOutputsEvent(step.Op(), step, false /*planning*/, acts.Opts.Debug, isInternalStep(step))
+	acts.Opts.Events.resourceOutputsEvent(
+		step.Op(),
+		step,
+		false, /*planning*/
+		acts.Opts.Debug,
+		isInternalStep(step),
+		acts.Opts.ShowSecrets,
+	)
 
 	// There's a chance there are new outputs that weren't written out last time.
 	// We need to perform another snapshot write to ensure they get written out.
@@ -745,7 +769,12 @@ func (acts *previewActions) OnResourceStepPre(step deploy.Step) (interface{}, er
 	acts.Seen[step.URN()] = step
 	acts.MapLock.Unlock()
 
-	acts.Opts.Events.resourcePreEvent(step, true /*planning*/, acts.Opts.Debug, isInternalStep(step))
+	acts.Opts.Events.resourcePreEvent(
+		step, true, /*planning*/
+		acts.Opts.Debug,
+		isInternalStep(step),
+		acts.Opts.ShowSecrets,
+	)
 
 	return nil, nil
 }
@@ -786,7 +815,14 @@ func (acts *previewActions) OnResourceStepPost(ctx interface{},
 			acts.MapLock.Unlock()
 		}
 
-		acts.Opts.Events.resourceOutputsEvent(op, step, true /*planning*/, acts.Opts.Debug, isInternalStep)
+		acts.Opts.Events.resourceOutputsEvent(
+			op,
+			step,
+			true, /*planning*/
+			acts.Opts.Debug,
+			isInternalStep,
+			acts.Opts.ShowSecrets,
+		)
 	}
 
 	return nil
@@ -798,7 +834,14 @@ func (acts *previewActions) OnResourceOutputs(step deploy.Step) error {
 	acts.MapLock.Unlock()
 
 	// Print the resource outputs separately.
-	acts.Opts.Events.resourceOutputsEvent(step.Op(), step, true /*planning*/, acts.Opts.Debug, isInternalStep(step))
+	acts.Opts.Events.resourceOutputsEvent(
+		step.Op(),
+		step,
+		true, /*planning*/
+		acts.Opts.Debug,
+		isInternalStep(step),
+		acts.Opts.ShowSecrets,
+	)
 
 	return nil
 }

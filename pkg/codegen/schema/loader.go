@@ -50,6 +50,35 @@ type PackageDescriptor struct {
 	Parameterization *ParameterizationDescriptor // the optional parameterization of the package.
 }
 
+// PackageName returns the name of the package.
+func (pd PackageDescriptor) PackageName() string {
+	if pd.Parameterization != nil {
+		return pd.Parameterization.Name
+	}
+	return pd.Name
+}
+
+// PackageVersion returns the version of the package.
+func (pd PackageDescriptor) PackageVersion() *semver.Version {
+	if pd.Parameterization != nil {
+		return &pd.Parameterization.Version
+	}
+	return pd.Version
+}
+
+func (pd *PackageDescriptor) String() string {
+	version := "nil"
+	if pd.Version != nil {
+		version = pd.Version.String()
+	}
+
+	// If the package descriptor has a parameterization, write that information out first.
+	if pd.Parameterization != nil {
+		return fmt.Sprintf("%s@%s (%s@%s)", pd.Parameterization.Name, pd.Parameterization.Version, pd.Name, version)
+	}
+	return fmt.Sprintf("%s@%s", pd.Name, version)
+}
+
 type Loader interface {
 	// deprecated: use LoadPackageV2
 	LoadPackage(pkg string, version *semver.Version) (*Package, error)
@@ -154,7 +183,7 @@ func (l *pluginLoader) LoadPackageReferenceV2(
 		return DefaultPulumiPackage.Reference(), nil
 	}
 
-	schemaBytes, version, err := l.loadSchemaBytes(ctx, descriptor)
+	schemaBytes, pluginVersion, err := l.loadSchemaBytes(ctx, descriptor)
 	if err != nil {
 		return nil, err
 	}
@@ -167,21 +196,15 @@ func (l *pluginLoader) LoadPackageReferenceV2(
 		return nil, err
 	}
 
-	// Insert a version into the spec if the package does not provide one or if the
-	// existing version is less than the provided one
-	if version != nil {
-		setVersion := true
-		if spec.PackageInfoSpec.Version != "" {
-			vSemver, err := semver.Make(spec.PackageInfoSpec.Version)
-			if err == nil {
-				if vSemver.Compare(*version) == 1 {
-					setVersion = false
-				}
-			}
-		}
-		if setVersion {
-			spec.PackageInfoSpec.Version = version.String()
-		}
+	// If the spec we've loaded doesn't specify a version, and we've got a plugin version to hand, we'll add that plugin
+	// version to the loaded schema. Note that in the case of parameterized providers and their schema, plugin and package
+	// version need not (and in general, won't) match -- if we were using version 0.8.0 of the Terraform provider to
+	// bridge some package foo/bar@v0.1.0, for instance, we'd have a plugin version of 0.8.0 and a package version of
+	// 0.1.0. We thus guard against this case, though in theory this is unnecessary -- schema versions are required for
+	// parameterized providers, so we should expect not to hit this case and overwrite a (parameterized) package version
+	// with an almost certainly different plugin version.
+	if pluginVersion != nil && descriptor.Parameterization == nil && spec.PackageInfoSpec.Version == "" {
+		spec.PackageInfoSpec.Version = pluginVersion.String()
 	}
 
 	p, err := ImportPartialSpec(spec, nil, l)
@@ -202,6 +225,12 @@ func LoadPackageReference(loader Loader, pkg string, version *semver.Version) (P
 		})
 }
 
+// LoadPackageReferenceV2 loads a package reference for the given descriptor using the given loader. When a reference is
+// loaded, the name and version of the reference are compared to the requested name and version. If the name or version
+// do not match, a PackageReferenceNameMismatchError or PackageReferenceVersionMismatchError is returned, respectively.
+//
+// In the event that a mismatch error is returned, the reference is still returned. This is to allow for the caller to
+// decide whether or not the mismatch impacts their use of the reference.
 func LoadPackageReferenceV2(
 	ctx context.Context, loader Loader, descriptor *PackageDescriptor,
 ) (PackageReference, error) {
@@ -230,21 +259,99 @@ func LoadPackageReferenceV2(
 		version = &descriptor.Parameterization.Version
 	}
 
-	if name != ref.Name() ||
-		version != nil &&
-			ref.Version() != nil &&
-			!ref.Version().Equals(*version) {
-		if l, ok := loader.(*cachedLoader); ok {
-			return nil, fmt.Errorf("req: %s@%v: entries: %v (returned %s@%v)", name, version,
-				l.entries, ref.Name(), ref.Version())
+	if name != ref.Name() {
+		return ref, &PackageReferenceNameMismatchError{
+			RequestedName:    name,
+			RequestedVersion: version,
+			LoadedName:       ref.Name(),
+			LoadedVersion:    ref.Version(),
 		}
-		return nil, fmt.Errorf(
-			"loader returned %s@%v: expected %s@%v", ref.Name(), ref.Version(), name, version)
+	}
+
+	if version != nil && ref.Version() != nil && !ref.Version().Equals(*version) {
+		err := &PackageReferenceVersionMismatchError{
+			RequestedName:    name,
+			RequestedVersion: version,
+			LoadedName:       ref.Name(),
+			LoadedVersion:    ref.Version(),
+		}
+		if l, ok := loader.(*cachedLoader); ok {
+			err.Message = fmt.Sprintf("entries: %v", l.entries)
+		}
+
+		return ref, err
 	}
 
 	return ref, nil
 }
 
+// PackageReferenceNameMismatchError is the type of errors returned by LoadPackageReferenceV2 when the name of the
+// loaded reference does not match the requested name.
+type PackageReferenceNameMismatchError struct {
+	// The requested . name
+	RequestedName string
+	// The requested version.
+	RequestedVersion *semver.Version
+	// The loaded name.
+	LoadedName string
+	// The loaded version.
+	LoadedVersion *semver.Version
+	// An optional message to be appended to the error's string representation.
+	Message string
+}
+
+func (e *PackageReferenceNameMismatchError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf(
+			"loader returned %s@%v; requested %s@%v",
+			e.LoadedName, e.LoadedVersion,
+			e.RequestedName, e.RequestedVersion,
+		)
+	}
+
+	return fmt.Sprintf(
+		"loader returned %s@%v; requested %s@%v (%s)",
+		e.LoadedName, e.LoadedVersion,
+		e.RequestedName, e.RequestedVersion,
+		e.Message,
+	)
+}
+
+// PackageReferenceVersionMismatchError is the type of errors returned by LoadPackageReferenceV2 when the version of the
+// loaded reference does not match the requested version.
+type PackageReferenceVersionMismatchError struct {
+	// The requested name.
+	RequestedName string
+	// The requested version.
+	RequestedVersion *semver.Version
+	// The loaded name.
+	LoadedName string
+	// The loaded version.
+	LoadedVersion *semver.Version
+	// An optional message to be appended to the error's string representation.
+	Message string
+}
+
+func (e *PackageReferenceVersionMismatchError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf(
+			"loader returned %s@%v; requested %s@%v",
+			e.LoadedName, e.LoadedVersion,
+			e.RequestedName, e.RequestedVersion,
+		)
+	}
+
+	return fmt.Sprintf(
+		"loader returned %s@%v; requested %s@%v (%s)",
+		e.LoadedName, e.LoadedVersion,
+		e.RequestedName, e.RequestedVersion,
+		e.Message,
+	)
+}
+
+// loadSchemaBytes loads the byte representation of the schema for the given package descriptor. Additionally, when
+// successful, it returns the version of the underlying *plugin* that provided that schema (not to be confused with the
+// version of the package included in the schema itself).
 func (l *pluginLoader) loadSchemaBytes(
 	ctx context.Context, descriptor *PackageDescriptor,
 ) ([]byte, *semver.Version, error) {
@@ -252,7 +359,7 @@ func (l *pluginLoader) loadSchemaBytes(
 	if err != nil {
 		return nil, nil, err
 	}
-	version := descriptor.Version
+	pluginVersion := descriptor.Version
 
 	// If PULUMI_DEBUG_PROVIDERS requested an attach port, skip caching and workspace
 	// interaction and load the schema directly from the given port.
@@ -262,15 +369,15 @@ func (l *pluginLoader) loadSchemaBytes(
 			return nil, nil, fmt.Errorf("Error loading schema from plugin: %w", err)
 		}
 
-		if version == nil {
+		if pluginVersion == nil {
 			info, err := provider.GetPluginInfo(ctx)
 			contract.IgnoreError(err) // nonfatal error
-			version = info.Version
+			pluginVersion = info.Version
 		}
-		return schemaBytes, version, nil
+		return schemaBytes, pluginVersion, nil
 	}
 
-	pluginInfo, err := l.host.ResolvePlugin(apitype.ResourcePlugin, descriptor.Name, version)
+	pluginInfo, err := l.host.ResolvePlugin(apitype.ResourcePlugin, descriptor.Name, pluginVersion)
 	if err != nil {
 		// Try and install the plugin if it was missing and try again, unless auto plugin installs are turned off.
 		var missingError *workspace.MissingError
@@ -281,7 +388,7 @@ func (l *pluginLoader) loadSchemaBytes(
 		spec := workspace.PluginSpec{
 			Kind:              apitype.ResourcePlugin,
 			Name:              descriptor.Name,
-			Version:           version,
+			Version:           pluginVersion,
 			PluginDownloadURL: descriptor.DownloadURL,
 		}
 
@@ -294,18 +401,20 @@ func (l *pluginLoader) loadSchemaBytes(
 			return nil, nil, err
 		}
 
-		pluginInfo, err = l.host.ResolvePlugin(apitype.ResourcePlugin, descriptor.Name, version)
+		pluginInfo, err = l.host.ResolvePlugin(apitype.ResourcePlugin, descriptor.Name, pluginVersion)
 		if err != nil {
-			return nil, version, err
+			return nil, pluginVersion, err
 		}
 	}
 	contract.Assertf(pluginInfo != nil, "loading pkg %q: pluginInfo was unexpectedly nil", descriptor.Name)
 
-	if version == nil {
-		version = pluginInfo.Version
+	if pluginVersion == nil {
+		pluginVersion = pluginInfo.Version
 	}
 
-	if pluginInfo.SchemaPath != "" && version != nil && descriptor.Parameterization == nil {
+	canCache := pluginInfo.SchemaPath != "" && pluginVersion != nil && descriptor.Parameterization == nil
+
+	if canCache {
 		schemaBytes, ok := l.loadCachedSchemaBytes(descriptor.Name, pluginInfo.SchemaPath, pluginInfo.SchemaTime)
 		if ok {
 			return schemaBytes, nil, nil
@@ -317,19 +426,19 @@ func (l *pluginLoader) loadSchemaBytes(
 		return nil, nil, fmt.Errorf("Error loading schema from plugin: %w", err)
 	}
 
-	if pluginInfo.SchemaPath != "" {
+	if canCache {
 		err = atomic.WriteFile(pluginInfo.SchemaPath, bytes.NewReader(schemaBytes))
 		if err != nil {
 			return nil, nil, fmt.Errorf("Error writing schema from plugin to cache: %w", err)
 		}
 	}
 
-	if version == nil {
+	if pluginVersion == nil {
 		info, _ := provider.GetPluginInfo(ctx) // nonfatal error
-		version = info.Version
+		pluginVersion = info.Version
 	}
 
-	return schemaBytes, version, nil
+	return schemaBytes, pluginVersion, nil
 }
 
 func (l *pluginLoader) loadPluginSchemaBytes(

@@ -204,14 +204,8 @@ func NewRefreshCmd() *cobra.Command {
 				return fmt.Errorf("gathering environment metadata: %w", err)
 			}
 
-			decrypter, err := sm.Decrypter()
-			if err != nil {
-				return fmt.Errorf("getting stack decrypter: %w", err)
-			}
-			encrypter, err := sm.Encrypter()
-			if err != nil {
-				return fmt.Errorf("getting stack encrypter: %w", err)
-			}
+			decrypter := sm.Decrypter()
+			encrypter := sm.Encrypter()
 
 			stackName := s.Ref().Name().String()
 			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(
@@ -288,6 +282,7 @@ func NewRefreshCmd() *cobra.Command {
 				DisableOutputValues:       env.DisableOutputValues.Value(),
 				Targets:                   deploy.NewUrnTargets(targetUrns),
 				Experimental:              env.Experimental.Value(),
+				ExecKind:                  execKind,
 			}
 
 			changes, err := s.Refresh(ctx, backend.UpdateOperation{
@@ -319,7 +314,7 @@ func NewRefreshCmd() *cobra.Command {
 		"Print detailed debugging output during resource operations")
 	cmd.PersistentFlags().BoolVar(
 		&expectNop, "expect-no-changes", false,
-		"Return an error if any changes occur during this update")
+		"Return an error if any changes occur during this refresh. This check happens after the refresh is applied")
 	cmd.PersistentFlags().StringVarP(
 		&stackName, "stack", "s", "",
 		"The name of the stack to operate on. Defaults to the current stack")

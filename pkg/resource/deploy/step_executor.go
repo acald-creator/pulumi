@@ -367,9 +367,20 @@ func (se *stepExecutor) cancelDueToError(err error, step Step) {
 	if !set {
 		logging.V(10).Infof("StepExecutor already recorded an error then saw: %v", err)
 	}
+
+	continueOnError := se.deployment.opts.ContinueOnError
+	// We special case deleteProtectedError to always continue past them, this allows us to report back all
+	// protect delete errors in a single run. We know we didn't attempt to do any actual delete, _and_ as
+	// these are deletes there's nothing replied to the user program, it's safe to continue past them. There
+	// are no observable effects in the user program, its just the CLI will be able to continue past and
+	// report any other issues.
+	if errors.As(err, &deleteProtectedError{}) {
+		continueOnError = true
+	}
+
 	if se.ignoreErrors {
 		// Do nothing.
-	} else if se.deployment.opts.ContinueOnError {
+	} else if continueOnError {
 		step.Fail()
 		// Record the failure, but allow the deployment to continue.
 		se.erroredStepLock.Lock()
@@ -474,9 +485,14 @@ func (se *stepExecutor) executeStep(workerID int, step Step) error {
 
 		newState.Lock.Unlock()
 
-		// If this is not a resource that is managed by Pulumi, then we can ignore it.
+		// At this point we'll track the resource so that it can be looked up later by e.g. consumers resolving resource
+		// references using pulumi:pulumi:getResource. If it's a resource managed by Pulumi (i.e. it's the result of a
+		// resource registration with a goal state), we'll record it in news. If it's not managed by Pulumi (i.e. it's the
+		// result of a Read, perhaps caused by a .get in an SDK, for instance), we'll record it in reads.
 		if _, hasGoal := se.deployment.goals.Load(newState.URN); hasGoal {
 			se.deployment.news.Store(newState.URN, newState)
+		} else if step.Op() == OpRead || step.Op() == OpReadReplacement {
+			se.deployment.reads.Store(newState.URN, newState)
 		}
 
 		// If we're generating plans update the resource's outputs in the generated plan.

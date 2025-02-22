@@ -1,4 +1,4 @@
-// Copyright 2024, Pulumi Corporation.
+// Copyright 2024-2025, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend"
 	cmdStack "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/stack"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
+	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
@@ -155,10 +156,7 @@ func getStackConfigurationFromProjectStack(
 		}, nil
 	}
 
-	crypter, err := sm.Decrypter()
-	if err != nil {
-		return backend.StackConfiguration{}, fmt.Errorf("getting configuration decrypter: %w", err)
-	}
+	crypter := sm.Decrypter()
 
 	return backend.StackConfiguration{
 		EnvironmentImports: workspaceStack.Environment.Imports(),
@@ -246,7 +244,7 @@ func copySingleConfigKey(
 	destinationProjectStack *workspace.ProjectStack,
 ) error {
 	var decrypter config.Decrypter
-	key, err := ParseConfigKey(configKey)
+	key, err := ParseConfigKey(pkgWorkspace.Instance, configKey, path)
 	if err != nil {
 		return fmt.Errorf("invalid configuration key: %w", err)
 	}
@@ -290,7 +288,7 @@ func copySingleConfigKey(
 	return cmdStack.SaveProjectStack(destinationStack, destinationProjectStack)
 }
 
-func parseKeyValuePair(pair string) (config.Key, string, error) {
+func parseKeyValuePair(pair string, path bool) (config.Key, string, error) {
 	// Split the arg on the first '=' to separate key and value.
 	splitArg := strings.SplitN(pair, "=", 2)
 
@@ -304,7 +302,7 @@ func parseKeyValuePair(pair string) (config.Key, string, error) {
 	if len(splitArg) < 2 {
 		return config.Key{}, "", errors.New("config value must be in the form [key]=[value]")
 	}
-	key, err := ParseConfigKey(splitArg[0])
+	key, err := ParseConfigKey(pkgWorkspace.Instance, splitArg[0], path)
 	if err != nil {
 		return config.Key{}, "", fmt.Errorf("invalid configuration key: %w", err)
 	}
@@ -313,11 +311,33 @@ func parseKeyValuePair(pair string) (config.Key, string, error) {
 	return key, value, nil
 }
 
-func ParseConfigKey(key string) (config.Key, error) {
+// ParseConfigKey converts a given key string to a config.Key.
+// Depending on whether the key is a path or not, the same string can either
+// be valid or not, and also parse to different keys. For example:
+// foo.bar:buzz is a (namespace: foo.bar, key: buzz) if not path, and
+// (namespace: <project-name>, key: foo.bar:buzz) if path.
+func ParseConfigKey(ws pkgWorkspace.Context, key string, path bool) (config.Key, error) {
+	// If the key is a path, the namespacing requirement only applies to the
+	// top-level key, while sub-keys may have arbitrary names.
+	if path {
+		// Figure out if the key has multiple segments (delimetered by dots and square brackets).
+		// If they exist, we'll parse the first segment to validate its structure and obtain its
+		// namespace. Then we'll use this namespace with the rest of the key.
+		bracketOrDotIndex := strings.IndexAny(key, "[.")
+		if bracketOrDotIndex > 0 {
+			topSegment := key[:bracketOrDotIndex]
+			topKey, err := ParseConfigKey(ws, topSegment, false)
+			if err != nil {
+				return config.Key{}, err
+			}
+			return config.MustMakeKey(topKey.Namespace(), topKey.Name()+key[bracketOrDotIndex:]), nil
+		}
+	}
+
 	// As a convenience, we'll treat any key with no delimiter as if:
 	// <program-name>:<key> had been written instead
 	if !strings.Contains(key, tokens.TokenDelimiter) {
-		proj, err := workspace.DetectProject()
+		proj, _, err := ws.ReadProject()
 		if err != nil {
 			return config.Key{}, err
 		}

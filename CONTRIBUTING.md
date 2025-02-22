@@ -45,7 +45,7 @@ You'll want to install the following on your machine:
 You can get all required dependencies with brew and npm
 
 ```bash
-brew install node python@3 typescript yarn go@1.23 golangci/tap/golangci-lint gofumpt pulumi/tap/pulumictl coreutils jq
+brew install node python@3 typescript yarn go@1.23 golangci/tap/golangci-lint gofumpt pulumi/tap/pulumictl coreutils jq uv
 curl https://raw.githubusercontent.com/Homebrew/homebrew-cask/339862f79e/Casks/dotnet-sdk.rb > dotnet-sdk.rb
 brew install --HEAD -s dotnet-sdk.rb
 rm dotnet-sdk.rb
@@ -53,7 +53,10 @@ rm dotnet-sdk.rb
 
 ### Make build system
 
-We use `make` as our build system, so you'll want to install that as well, if you don't have it already. We have extremely limited support for doing development on Windows (the bare minimum for us to get Windows validation of `pulumi`) so if you're on windows, we recommend that you use the [Windows Subsystem for Linux](https://docs.microsoft.com/en-us/windows/wsl/install-win10). We'd like to [make this better](https://github.com/pulumi/pulumi/issues/208) so feel free to pitch in if you can.
+We use `make` as our build system, so you'll want to install that as well, if you don't have it already. If you're on windows, we recommend that you use the [Windows Subsystem for Linux](https://docs.microsoft.com/en-us/windows/wsl/install-win10).
+
+> [!NOTE] There are multiple binaries contained in this repository, specifically the Pulumi CLI (under `./pkg/cmd`), and the language plugins (under `./sdk/<language>` ).
+Each binary must be built separately via its own Make targets, but the targets follow the regular set described below.
 
 We build Pulumi in `$PULUMI_ROOT`, which defaults to `$HOME/.pulumi-dev`. If you would like to build Pulumi in another location, you do so by setting `$PULUMI_ROOT`.
 
@@ -71,9 +74,12 @@ ulimit -n 5000
 Across our projects, we try to use a regular set of make targets. The ones you'll care most about are:
 
 1. `make ensure`, which restores/installs any build dependencies
-1. `make dist`, which just builds and installs the Pulumi CLI
+1. `make build install`, which builds and installs the specified binary at the specified `PULUMI_ROOT`'s `bin` folder
+1. `make dist`, which just builds and installs the specified binary
 1. `make`, which builds Pulumi and runs a quick set of tests
 1. `make all` which builds Pulumi and runs the quick tests and a larger set of tests.
+
+
 
 We make heavy use of integration level tests that invoke `pulumi` to create and then delete cloud resources. In order to run our integration tests, you will need a Pulumi account (so [sign up for free](https://pulumi.com) today if you haven't already) and log in with `pulumi login`.  Additionally, before running integration tests, be sure to set the environment variable `PULUMI_TEST_ORG` to your pulumi username.
 
@@ -166,3 +172,19 @@ alike. We encourage you to explore it and reach out if you have any questions!
 ## Getting Help
 
 We're sure there are rough edges and we appreciate you helping out. If you want to talk with other folks in the Pulumi community (including members of the Pulumi team) come hang out in the `#contribute` channel on the [Pulumi Community Slack](https://slack.pulumi.com/).
+
+## Releasing
+
+Whenever a new PR is merged in this repository, the latest draft release on the [GitHub Releases page](https://github.com/pulumi/pulumi/releases) is updated with the latest binaries.  To release one of those draft releases a few steps are necessary:
+
+If `sdk/.version` is the version we want to release, we need to "freeze" that draft release.  To do that update the version in `pulumi/pulumi` using `scripts/set-version.py <next-patch-version>`.  This stops the draft release for the current version from being updated, and thus it is ready to be released.
+
+If `sdk/.version` is not the version we want to release yet, usually in the case of a minor release, bump the version to the right version first, and merge that first (always using `scripts/set-version.py`).  Once that's merged the current release can be frozen as above.
+
+For these version bump PRs it's useful for reviewers if the expected changelog is included.  This can be generated using `GITHUB_REPOSITORY=pulumi/pulumi go run github.com/pulumi/go-change@v0.1.3 render`, at the root of the repository.
+
+The next step, to gain some additional confidence in the release is to run the [Test examples](https://github.com/pulumi/examples/actions/workflows/test-examples.yml), and [Test templates](https://github.com/pulumi/templates/actions/workflows/test-templates.yml) test suites.  These run the tests in the `pulumi/examples` and `pulumi/templates` repositories using the latest `pulumi/pulumi` dev version, thus including all the latest changes.
+
+Finally to create the release, navigate to the [GitHub Releases page](https://github.com/pulumi/pulumi/releases) and edit the release of the version we froze just before.  Untick "Set as a pre-release", and tick both "Set as the latest release" and "Create a discussion for this release" at the bottom of the page, before clicking "Publish release".
+
+Finally `pulumi-bot` will create another PR to update with `go.mod` updates and changelog cleanups.  This PR needs to be approved, and will then auto-merge.

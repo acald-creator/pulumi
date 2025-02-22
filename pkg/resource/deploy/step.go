@@ -155,7 +155,12 @@ func (s *SameStep) Apply() (resource.Status, StepCompleteFunc, error) {
 	// We can only do this if the provider is actually a same, not a skipped create.
 	if providers.IsProviderType(s.new.Type) && !s.skippedCreate {
 		if s.Deployment() != nil {
-			err := s.Deployment().SameProvider(s.new)
+			// We need to use the new state here (so that URN and ID are correct), but we want to use the old
+			// inputs. This ensures that providers that report changed inputs as NO_DIFF consistently see the
+			// old inputs, not the new ones.
+			st := s.new.Copy()
+			st.Inputs = s.old.Inputs
+			err := s.Deployment().SameProvider(st)
 			if err != nil {
 				return resource.StatusOK, nil,
 					fmt.Errorf("bad provider state for resource %v: %w", s.URN(), err)
@@ -291,6 +296,8 @@ func (s *CreateStep) Apply() (resource.Status, StepCompleteFunc, error) {
 
 		resp, err := prov.Create(context.TODO(), plugin.CreateRequest{
 			URN:        s.URN(),
+			Name:       s.new.URN.Name(),
+			Type:       s.new.URN.Type(),
 			Properties: s.new.Inputs,
 			Timeout:    s.new.CustomTimeouts.Create,
 			Preview:    s.deployment.opts.DryRun,
@@ -864,6 +871,8 @@ func (s *ReadStep) Apply() (resource.Status, StepCompleteFunc, error) {
 		// send of inputs as both "inputs" and "state". Something to break to tidy up in V4.
 		result, err := prov.Read(context.TODO(), plugin.ReadRequest{
 			URN:    urn,
+			Name:   urn.Name(),
+			Type:   urn.Type(),
 			ID:     id,
 			Inputs: s.new.Inputs,
 			State:  s.new.Inputs,
@@ -940,13 +949,12 @@ type RefreshStep struct {
 	deployment *Deployment       // the deployment that produced this refresh
 	old        *resource.State   // the old resource state, if one exists for this urn
 	new        *resource.State   // the new resource state, to be used to query the provider
-	done       chan<- bool       // the channel to use to signal completion, if any
 	provider   plugin.Provider   // the optional provider to use.
 	diff       plugin.DiffResult // the diff between the cloud provider and the state file
 }
 
 // NewRefreshStep creates a new Refresh step.
-func NewRefreshStep(deployment *Deployment, old *resource.State, done chan<- bool) Step {
+func NewRefreshStep(deployment *Deployment, old *resource.State) Step {
 	contract.Requiref(old != nil, "old", "must not be nil")
 
 	// NOTE: we set the new state to the old state by default so that we don't interpret step failures as deletes.
@@ -954,7 +962,6 @@ func NewRefreshStep(deployment *Deployment, old *resource.State, done chan<- boo
 		deployment: deployment,
 		old:        old,
 		new:        old,
-		done:       done,
 	}
 }
 
@@ -1004,9 +1011,6 @@ func (s *RefreshStep) ResultOp() display.StepOp {
 
 func (s *RefreshStep) Apply() (resource.Status, StepCompleteFunc, error) {
 	var complete func()
-	if s.done != nil {
-		complete = func() { close(s.done) }
-	}
 
 	resourceID := s.old.ID
 
@@ -1024,6 +1028,8 @@ func (s *RefreshStep) Apply() (resource.Status, StepCompleteFunc, error) {
 	var initErrors []string
 	refreshed, err := prov.Read(context.TODO(), plugin.ReadRequest{
 		URN:    s.old.URN,
+		Name:   s.old.URN.Name(),
+		Type:   s.old.URN.Type(),
 		ID:     resourceID,
 		Inputs: s.old.Inputs,
 		State:  s.old.Outputs,
@@ -1278,8 +1284,10 @@ func (s *ImportStep) Apply() (resource.Status, StepCompleteFunc, error) {
 			return resource.StatusOK, nil, err
 		}
 		read, err := prov.Read(context.TODO(), plugin.ReadRequest{
-			URN: s.new.URN,
-			ID:  s.new.ID,
+			URN:  s.new.URN,
+			Name: s.new.URN.Name(),
+			Type: s.new.URN.Type(),
+			ID:   s.new.ID,
 		})
 		rst = read.Status
 

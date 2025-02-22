@@ -30,7 +30,36 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 )
+
+type Parameterization struct {
+	// The base plugin name to use for this parameterization.
+	PluginName tokens.Package
+	// The version of the plugin to use for this parameterization.
+	PluginVersion semver.Version
+	// The value to use for this parameterization.
+	Value []byte
+}
+
+// ToProviderParameterization converts a workspace parameterization to a provider parameterization.
+func (p *Parameterization) ToProviderParameterization(
+	typ tokens.Type, version *semver.Version,
+) (tokens.Package, *semver.Version, *workspace.Parameterization, error) {
+	if p == nil {
+		return typ.Package(), version, nil, nil
+	}
+
+	if version == nil {
+		return "", nil, nil, errors.New("version must be provided")
+	}
+
+	return p.PluginName, &p.PluginVersion, &workspace.Parameterization{
+		Name:    string(typ.Package()),
+		Version: *version,
+		Value:   p.Value,
+	}, nil
+}
 
 // An Import specifies a resource to import.
 type Import struct {
@@ -44,6 +73,7 @@ type Import struct {
 	PluginChecksums   map[string][]byte // The provider checksums to use for the resource, if any.
 	Protect           bool              // Whether to mark the resource as protected after import
 	Properties        []string          // Which properties to include (Defaults to required properties)
+	Parameterization  *Parameterization // The parameterization to use for the resource, if any.
 
 	// True if this import should create an empty component resource. ID must not be set if this is used.
 	Component bool
@@ -92,7 +122,12 @@ func NewImportDeployment(
 	// Create a goal map for the deployment.
 	newGoals := &gsync.Map[resource.URN, *resource.Goal]{}
 
-	builtins := newBuiltinProvider(nil, nil, ctx.Diag)
+	builtins := newBuiltinProvider(
+		nil, /*backendClient*/
+		nil, /*news*/
+		nil, /*reads*/
+		ctx.Diag,
+	)
 
 	// Create a new provider registry.
 	reg := providers.NewRegistry(ctx.Host, opts.DryRun, builtins)
@@ -132,7 +167,6 @@ func (noopOutputsEvent) Done()                         {}
 type importer struct {
 	deployment *Deployment
 	executor   *stepExecutor
-	preview    bool
 }
 
 func (i *importer) executeSerial(ctx context.Context, steps ...Step) bool {
@@ -225,7 +259,13 @@ func (i *importer) registerProviders(ctx context.Context) (map[resource.URN]stri
 		if imp.Type.Package() == "" {
 			return nil, false, errors.New("incorrect package type specified")
 		}
-		req := providers.NewProviderRequest(imp.Type.Package(), imp.Version, imp.PluginDownloadURL, imp.PluginChecksums, nil)
+
+		pkg, version, parameterization, err := imp.Parameterization.ToProviderParameterization(imp.Type, imp.Version)
+		if err != nil {
+			return nil, false, err
+		}
+		req := providers.NewProviderRequest(
+			pkg, version, imp.PluginDownloadURL, imp.PluginChecksums, parameterization)
 		typ, name := providers.MakeProviderType(req.Package()), req.DefaultName()
 		urn := i.deployment.generateURN("", typ, name)
 		if state, ok := i.deployment.olds[urn]; ok {
@@ -274,6 +314,10 @@ func (i *importer) registerProviders(ctx context.Context) (map[resource.URN]stri
 		if checksums := req.PluginChecksums(); checksums != nil {
 			providers.SetProviderChecksums(inputs, checksums)
 		}
+		if parameterization := req.Parameterization(); parameterization != nil {
+			providers.SetProviderName(inputs, req.Name())
+			providers.SetProviderParameterization(inputs, parameterization)
+		}
 		resp, err := i.deployment.providers.Check(ctx, plugin.CheckRequest{
 			URN:  urn,
 			News: inputs,
@@ -302,12 +346,8 @@ func (i *importer) registerProviders(ctx context.Context) (map[resource.URN]stri
 	// Update the URN to reference map.
 	for _, s := range steps {
 		res := s.Res()
-		id := res.ID
-		if i.preview {
-			id = providers.UnknownID
-		}
-		ref, err := providers.NewReference(res.URN, id)
-		contract.AssertNoErrorf(err, "could not create provider reference with URN %q and ID %q", res.URN, id)
+		ref, err := providers.NewReference(res.URN, res.ID)
+		contract.AssertNoErrorf(err, "could not create provider reference with URN %q and ID %q", res.URN, res.ID)
 		urnToReference[res.URN] = ref.String()
 	}
 
@@ -386,7 +426,12 @@ func (i *importer) importResources(ctx context.Context) error {
 
 		providerURN := imp.Provider
 		if providerURN == "" && (!imp.Component || imp.Remote) {
-			req := providers.NewProviderRequest(imp.Type.Package(), imp.Version, imp.PluginDownloadURL, imp.PluginChecksums, nil)
+			pkg, version, parameterization, err := imp.Parameterization.ToProviderParameterization(imp.Type, imp.Version)
+			if err != nil {
+				return err
+			}
+			req := providers.NewProviderRequest(
+				pkg, version, imp.PluginDownloadURL, imp.PluginChecksums, parameterization)
 			typ, name := providers.MakeProviderType(req.Package()), req.DefaultName()
 			providerURN = i.deployment.generateURN("", typ, name)
 		}

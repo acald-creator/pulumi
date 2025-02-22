@@ -58,7 +58,6 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 
-	javagen "github.com/pulumi/pulumi-java/pkg/codegen/java"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/dotnet"
 )
 
@@ -517,22 +516,31 @@ func generateImportedDefinitions(ctx *plugin.Context,
 	}
 
 	loader := schema.NewPluginLoader(ctx.Host)
-	return true, importer.GenerateLanguageDefinitions(out, loader, func(w io.Writer, p *pcl.Program) error {
-		files, _, err := programGenerator(p, loader)
-		if err != nil {
-			return err
-		}
+	err := importer.GenerateLanguageDefinitions(
+		out,
+		loader,
+		func(w io.Writer, p *pcl.Program) error {
+			files, _, err := programGenerator(p, loader)
+			if err != nil {
+				return err
+			}
 
-		var contents []byte
-		for _, v := range files {
-			contents = v
-		}
+			var contents []byte
+			for _, v := range files {
+				contents = v
+			}
 
-		if _, err := w.Write(contents); err != nil {
-			return err
-		}
-		return nil
-	}, resources, names)
+			if _, err := w.Write(contents); err != nil {
+				return err
+			}
+			return nil
+		},
+		resources,
+		snap.Resources,
+		names,
+	)
+
+	return true, err
 }
 
 func NewImportCmd() *cobra.Command {
@@ -695,7 +703,7 @@ func NewImportCmd() *cobra.Command {
 				}
 				defer contract.IgnoreClose(converter)
 
-				installProvider := func(provider tokens.Package) *semver.Version {
+				installPlugin := func(pluginName string) *semver.Version {
 					// If auto plugin installs are disabled just return nil, the mapper will still carry on
 					if env.DisableAutomaticPluginAcquisition.Value() {
 						return nil
@@ -705,21 +713,27 @@ func NewImportCmd() *cobra.Command {
 						pCtx.Diag.Logf(sev, diag.RawMessage("", msg))
 					}
 
-					pluginSpec := workspace.PluginSpec{
-						Name: string(provider),
-						Kind: apitype.ResourcePlugin,
+					pluginSpec, err := workspace.NewPluginSpec(pluginName, apitype.ResourcePlugin, nil, "", nil)
+					if err != nil {
+						pCtx.Diag.Warningf(diag.Message("", "failed to create plugin spec for provider %q: %v"), pluginName, err)
+						return nil
 					}
 					version, err := pkgWorkspace.InstallPlugin(ctx, pluginSpec, log)
 					if err != nil {
-						pCtx.Diag.Warningf(diag.Message("", "failed to install provider %q: %v"), provider, err)
+						pCtx.Diag.Warningf(diag.Message("", "failed to install provider %q: %v"), pluginName, err)
 						return nil
 					}
 					return version
 				}
 
-				mapper, err := convert.NewPluginMapper(
-					convert.DefaultWorkspace(), convert.ProviderFactoryFromHost(pCtx.Host),
-					from, nil, installProvider)
+				baseMapper, err := convert.NewBasePluginMapper(
+					convert.DefaultWorkspace(),
+					from, /*conversionKey*/
+					convert.ProviderFactoryFromHost(ctx, pCtx.Host),
+					installPlugin,
+					nil, /*mappings*/
+				)
+				mapper := convert.NewCachingMapper(baseMapper)
 				if err != nil {
 					return err
 				}
@@ -875,8 +889,6 @@ func NewImportCmd() *cobra.Command {
 			switch proj.Runtime.Name() {
 			case "dotnet":
 				programGenerator = wrapper(dotnet.GenerateProgram)
-			case "java":
-				programGenerator = wrapper(javagen.GenerateProgram)
 			default:
 				programGenerator = func(
 					program *pcl.Program, loader schema.ReferenceLoader,
@@ -928,14 +940,8 @@ func NewImportCmd() *cobra.Command {
 				return fmt.Errorf("gathering environment metadata: %w", err)
 			}
 
-			decrypter, err := sm.Decrypter()
-			if err != nil {
-				return fmt.Errorf("getting stack decrypter: %w", err)
-			}
-			encrypter, err := sm.Encrypter()
-			if err != nil {
-				return fmt.Errorf("getting stack encrypter: %w", err)
-			}
+			decrypter := sm.Decrypter()
+			encrypter := sm.Encrypter()
 
 			stackName := s.Ref().Name().String()
 			configErr := workspace.ValidateStackConfigAndApplyProjectConfig(

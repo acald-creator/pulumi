@@ -194,11 +194,7 @@ func SortedFunctionParameters(expr *model.FunctionCallExpression) []*schema.Prop
 
 	switch args := expr.Signature.Parameters[1].Type.(type) {
 	case *model.ObjectType:
-		if len(args.Annotations) == 0 {
-			return []*schema.Property{}
-		}
-
-		originalSchemaType, ok := args.Annotations[0].(*schema.ObjectType)
+		originalSchemaType, ok := model.GetObjectTypeAnnotation[*schema.ObjectType](args)
 		if !ok {
 			return []*schema.Property{}
 		}
@@ -274,9 +270,8 @@ func UnwrapOption(exprType model.Type) model.Type {
 			return exprType.ElementTypes[1]
 		} else if len(exprType.ElementTypes) == 2 && exprType.ElementTypes[1] == model.NoneType {
 			return exprType.ElementTypes[0]
-		} else {
-			return exprType
 		}
+		return exprType
 	default:
 		return exprType
 	}

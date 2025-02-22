@@ -1,4 +1,4 @@
-// Copyright 2016-2023, Pulumi Corporation.
+// Copyright 2016-2024, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,6 +36,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/backend/diy"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/pcl"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
+	"github.com/pulumi/pulumi/pkg/v3/display"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/resource/stack"
@@ -51,6 +52,7 @@ import (
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 	testingrpc "github.com/pulumi/pulumi/sdk/v3/proto/go/testing"
 	"github.com/segmentio/encoding/json"
+	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -667,8 +669,7 @@ func (eng *languageTestServer) RunLanguageTest(
 
 	// Just use base64 "secrets" for these tests
 	sm := b64secrets.NewBase64SecretsManager()
-	dec, err := sm.Decrypter()
-	contract.AssertNoErrorf(err, "base64 must be able to create a Decrypter")
+	dec := sm.Decrypter()
 
 	// Create a temp dir for the a diy backend to run in for the test
 	backendDir := filepath.Join(token.TemporaryDirectory, "backends", req.Test)
@@ -839,12 +840,65 @@ func (eng *languageTestServer) RunLanguageTest(
 			main,
 			project.Runtime.Options())
 
-		// TODO(https://github.com/pulumi/pulumi/issues/13941): We don't capture stdout/stderr from the language
-		// plugin, so we can't show it back to the test.
-		err = languageClient.InstallDependencies(plugin.InstallDependenciesRequest{Info: programInfo})
+		installStdout, installStderr, installDone, err := languageClient.InstallDependencies(
+			plugin.InstallDependenciesRequest{Info: programInfo},
+		)
 		if err != nil {
 			return makeTestResponse(fmt.Sprintf("install dependencies: %v", err)), nil
 		}
+
+		// We'll use a WaitGroup to wait for the stdout (1) and stderr (2) readers to be fully drained, as well as for the
+		// done channel to close (3), before we carry on.
+		var wg sync.WaitGroup
+		wg.Add(3)
+
+		var installStdoutBytes []byte
+		var installStderrBytes []byte
+
+		installErrorChan := make(chan error, 3)
+
+		go func() {
+			defer wg.Done()
+			var err error
+			if installStdoutBytes, err = io.ReadAll(installStdout); err != nil {
+				installErrorChan <- err
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			var err error
+			if installStderrBytes, err = io.ReadAll(installStderr); err != nil {
+				installErrorChan <- err
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			if err := <-installDone; err != nil {
+				installErrorChan <- err
+			}
+		}()
+
+		var installErrs []error
+		wg.Wait()
+		close(installErrorChan)
+		for err := range installErrorChan {
+			if err != nil {
+				installErrs = append(installErrs, err)
+			}
+		}
+
+		err = errors.Join(installErrs...)
+		if err != nil {
+			return &testingrpc.RunLanguageTestResponse{
+				Success:  false,
+				Messages: []string{fmt.Sprintf("install dependencies: %v", err)},
+				Stdout:   string(installStdoutBytes),
+				Stderr:   string(installStderrBytes),
+			}, nil
+		}
+
 		// TODO(https://github.com/pulumi/pulumi/issues/13942): This should only add new things, don't modify
 
 		// Query the language plugin for what it thinks the project dependencies are, we expect to see pulumi and the SDKs.
@@ -1062,7 +1116,7 @@ func (eng *languageTestServer) RunLanguageTest(
 			Decrypter: dec,
 		}
 
-		changes, res := s.Update(ctx, backend.UpdateOperation{
+		updateOperation := backend.UpdateOperation{
 			Proj:               project,
 			Root:               projectDir,
 			Opts:               opts,
@@ -1071,7 +1125,35 @@ func (eng *languageTestServer) RunLanguageTest(
 			SecretsManager:     sm,
 			SecretsProvider:    b64secrets.Base64SecretsProvider,
 			Scopes:             backend.CancellationScopes,
+		}
+
+		assertPreview := run.AssertPreview
+		if assertPreview == nil {
+			// if no assertPreview is provided for the test run, we create a default implementation
+			// where we simply assert that the preview changes did not error
+			assertPreview = func(l *tests.L, proj string, err error, p *deploy.Plan, changes display.ResourceChanges) {
+				assert.NoErrorf(l, err, "expected no error in preview")
+			}
+		}
+
+		// Perform a preview on the stack
+		plan, previewChanges, res := s.Preview(ctx, updateOperation, nil)
+
+		// assert preview results
+		previewResult := tests.WithL(func(l *tests.L) {
+			assertPreview(l, projectDir, res, plan, previewChanges)
 		})
+
+		if previewResult.Failed {
+			return &testingrpc.RunLanguageTestResponse{
+				Success:  !previewResult.Failed,
+				Messages: previewResult.Messages,
+				Stdout:   stdout.String(),
+				Stderr:   stderr.String(),
+			}, nil
+		}
+
+		changes, res := s.Update(ctx, updateOperation)
 
 		var snap *deploy.Snapshot
 		if res == nil {

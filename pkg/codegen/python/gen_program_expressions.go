@@ -1,4 +1,4 @@
-// Copyright 2020-2024, Pulumi Corporation.
+// Copyright 2020-2025, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -332,6 +332,47 @@ func (g *generator) GenFunctionCallExpression(w io.Writer, expr *model.FunctionC
 		g.Fgenf(w, "single_or_none(%v)", expr.Args[0])
 	case "mimeType":
 		g.Fgenf(w, "mimetypes.guess_type(%v)[0]", expr.Args[0])
+	case pcl.Call:
+		self := expr.Args[0]
+		method := expr.Args[1].(*model.TemplateExpression).Parts[0].(*model.LiteralValueExpression).Value.AsString()
+
+		if expr.Signature.MultiArgumentInputs {
+			err := fmt.Errorf("python program-gen does not implement MultiArgumentInputs for method '%s'", method)
+			panic(err)
+		}
+
+		validMethod := makeValidIdentifier(method)
+		g.Fgenf(w, "%v.%s(", self, validMethod)
+
+		var args *model.ObjectConsExpression
+		if converted, objectArgs, _ := pcl.RecognizeTypedObjectCons(expr.Args[2]); converted {
+			args = objectArgs
+		} else {
+			args = expr.Args[2].(*model.ObjectConsExpression)
+		}
+		if len(args.Items) > 0 {
+			indenter := func(f func()) { f() }
+			if len(args.Items) > 1 {
+				indenter = g.Indented
+			}
+			indenter(func() {
+				for i, item := range args.Items {
+					// Ignore non-literal keys
+					key, ok := item.Key.(*model.LiteralValueExpression)
+					if !ok || !key.Value.Type().Equals(cty.String) {
+						continue
+					}
+					keyVal := PyName(key.Value.AsString())
+					if i == 0 {
+						g.Fgenf(w, "%s=%.v", keyVal, item.Value)
+					} else {
+						g.Fgenf(w, ",\n%s%s=%.v", g.Indent, keyVal, item.Value)
+					}
+				}
+			})
+		}
+
+		g.Fprint(w, ")")
 	case pcl.Invoke:
 		if expr.Signature.MultiArgumentInputs {
 			err := fmt.Errorf("python program-gen does not implement MultiArgumentInputs for function '%v'",
@@ -466,6 +507,10 @@ func (g *generator) GenFunctionCallExpression(w io.Writer, expr *model.FunctionC
 		g.Fgen(w, "os.getcwd()")
 	case "getOutput":
 		g.Fgenf(w, "%v.get_output(%v)", expr.Args[0], expr.Args[1])
+	case "try":
+		g.genTry(w, expr.Args)
+	case "can":
+		g.genCan(w, expr.Args)
 	default:
 		var rng hcl.Range
 		if expr.Syntax != nil {
@@ -473,6 +518,40 @@ func (g *generator) GenFunctionCallExpression(w io.Writer, expr *model.FunctionC
 		}
 		g.genNYI(w, "FunctionCallExpression: %v (%v)", expr.Name, rng)
 	}
+}
+
+// genTry generates code for a `try` expression. Each argument is transformed into a closure to prevent its evaluation
+// (which may fail) from happening until the `try_` utility function chooses. This results in an expression of the form:
+//
+//	try_(
+//	    lambda: <arg1>,
+//	    lambda: <arg2>,
+//	    ...
+//	)
+func (g *generator) genTry(w io.Writer, args []model.Expression) {
+	contract.Assertf(len(args) > 0, "expected at least one argument to try")
+
+	g.Fprintf(w, "try_(")
+	for i, arg := range args {
+		g.Indented(func() {
+			g.Fgenf(w, "\n%slambda: %v", g.Indent, arg)
+		})
+		if i < len(args)-1 {
+			g.Fgen(w, ",")
+		} else {
+			g.Fgen(w, "\n")
+		}
+	}
+	g.Fprintf(w, "%s)", g.Indent)
+}
+
+// genCan generates code for a `can` expression. The argument is transformed into a closure to prevent its evaluation
+// (which may fail) from happening until the `can_` utility function chooses. This results in an expression of the form:
+//
+//	can_(lambda: <arg>)
+func (g *generator) genCan(w io.Writer, args []model.Expression) {
+	contract.Assertf(len(args) == 1, "expected exactly one argument to can")
+	g.Fgenf(w, "can_(lambda: %v)", args[0])
 }
 
 func (g *generator) GenIndexExpression(w io.Writer, expr *model.IndexExpression) {

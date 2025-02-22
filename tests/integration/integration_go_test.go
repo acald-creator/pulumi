@@ -1255,7 +1255,6 @@ func TestPackageAddGo(t *testing.T) {
 
 //nolint:paralleltest // mutates environment
 func TestPackageAddGoParameterized(t *testing.T) {
-	t.Skip("mod replace is wrong after pulumi-terraform-provider release https://github.com/pulumi/pulumi/issues/18048")
 	e := ptesting.NewEnvironment(t)
 
 	var err error
@@ -1265,14 +1264,15 @@ func TestPackageAddGoParameterized(t *testing.T) {
 	require.NoError(t, err)
 
 	_, _ = e.RunCommand("pulumi", "plugin", "install", "resource", "terraform-provider")
-	_, _ = e.RunCommand("pulumi", "package", "add", "terraform-provider", "hashicorp/random")
+	_, _ = e.RunCommand("pulumi", "package", "add", "terraform-provider", "NetApp/netapp-cloudmanager", "25.1.0")
 
-	assert.True(t, e.PathExists("sdks/random/go.mod"))
-	packageModBytes, err := os.ReadFile(filepath.Join(e.CWD, "sdks/random/go.mod"))
+	assert.True(t, e.PathExists("sdks/netapp-cloudmanager/go.mod"))
+	packageModBytes, err := os.ReadFile(filepath.Join(e.CWD, "sdks/netapp-cloudmanager/go.mod"))
 	assert.NoError(t, err)
 	packageMod, err := modfile.Parse("package.mod", packageModBytes, nil)
 	assert.NoError(t, err)
-	assert.Equal(t, "github.com/pulumi/pulumi-terraform-provider/sdks/go/random/v3", packageMod.Module.Mod.Path)
+	assert.Equal(t, "github.com/pulumi/pulumi-terraform-provider/sdks/go/netapp-cloudmanager/v25",
+		packageMod.Module.Mod.Path)
 
 	modBytes, err := os.ReadFile(filepath.Join(e.CWD, "go.mod"))
 	assert.NoError(t, err)
@@ -1280,13 +1280,90 @@ func TestPackageAddGoParameterized(t *testing.T) {
 	assert.NoError(t, err)
 
 	containsRename := false
+	containedRenames := make([]string, len(gomod.Replace))
 	for _, r := range gomod.Replace {
-		if r.New.Path == "./sdks/random" && r.Old.Path == "github.com/Pulumi/pulumi-random/sdk/go/v3" {
+		if r.New.Path == "./sdks/netapp-cloudmanager" &&
+			r.Old.Path == "github.com/pulumi/pulumi-terraform-provider/sdks/go/netapp-cloudmanager/v25" {
+			containsRename = true
+		}
+		containedRenames = append(containedRenames, r.Old.Path+" => "+r.New.Path)
+	}
+
+	assert.True(t, containsRename,
+		fmt.Sprintf("expected go.mod to contain a replace for the package.  Contains: %v", containedRenames))
+}
+
+//nolint:paralleltest // mutates environment
+func TestConvertTerraformProviderGo(t *testing.T) {
+	e := ptesting.NewEnvironment(t)
+
+	var err error
+	templatePath, err := filepath.Abs("convertfromterraform")
+	require.NoError(t, err)
+	err = fsutil.CopyFile(e.CWD, templatePath, nil)
+	require.NoError(t, err)
+
+	_, _ = e.RunCommand("pulumi", "plugin", "install", "converter", "terraform")
+	_, _ = e.RunCommand("pulumi", "plugin", "install", "resource", "terraform-provider", "0.8.0")
+	_, _ = e.RunCommand("pulumi", "convert", "--from", "terraform", "--language", "go", "--out", "godir")
+
+	assert.True(t, e.PathExists("godir/go.mod"))
+	assert.True(t, e.PathExists("godir/sdks/supabase/go.mod"))
+
+	modBytes, err := os.ReadFile(filepath.Join(e.CWD, "godir", "go.mod"))
+	assert.NoError(t, err)
+	gomod, err := modfile.Parse("go.mod", modBytes, nil)
+	assert.NoError(t, err)
+
+	containsRename := false
+	for _, r := range gomod.Replace {
+		if r.New.Path == "./sdks/supabase" && r.Old.Path ==
+			"github.com/pulumi/pulumi-terraform-provider/sdks/go/supabase" {
 			containsRename = true
 		}
 	}
 
 	assert.True(t, containsRename)
+}
+
+//nolint:paralleltest // mutates environment
+func TestConvertMultipleTerraformProviderGo(t *testing.T) {
+	e := ptesting.NewEnvironment(t)
+
+	var err error
+	templatePath, err := filepath.Abs("convertmultiplefromterraform")
+	require.NoError(t, err)
+	err = fsutil.CopyFile(e.CWD, templatePath, nil)
+	require.NoError(t, err)
+
+	_, _ = e.RunCommand("pulumi", "plugin", "install", "converter", "terraform")
+	_, _ = e.RunCommand("pulumi", "plugin", "install", "resource", "terraform-provider")
+	_, _ = e.RunCommand("pulumi", "convert", "--from", "terraform", "--language", "go", "--out", "godir")
+
+	assert.True(t, e.PathExists("godir/go.mod"))
+	assert.True(t, e.PathExists("godir/sdks/supabase/go.mod"))
+	assert.True(t, e.PathExists("godir/sdks/b2/go.mod"))
+
+	modBytes, err := os.ReadFile(filepath.Join(e.CWD, "godir", "go.mod"))
+	assert.NoError(t, err)
+	gomod, err := modfile.Parse("go.mod", modBytes, nil)
+	assert.NoError(t, err)
+
+	containsRenameSupabase := false
+	containsRenameBB := false
+	for _, r := range gomod.Replace {
+		if r.New.Path == "./sdks/supabase" && r.Old.Path ==
+			"github.com/pulumi/pulumi-terraform-provider/sdks/go/supabase" {
+			containsRenameSupabase = true
+		}
+		if r.New.Path == "./sdks/b2" && r.Old.Path ==
+			"github.com/pulumi/pulumi-terraform-provider/sdks/go/b2" {
+			containsRenameBB = true
+		}
+	}
+
+	assert.True(t, containsRenameSupabase)
+	assert.True(t, containsRenameBB)
 }
 
 func readUpdateEventLog(logfile string) ([]apitype.EngineEvent, error) {
@@ -1482,10 +1559,9 @@ func TestRunPlugin(t *testing.T) {
 
 	e.CWD = filepath.Join(e.RootPath, "provider-python")
 	e.RunCommand("python", "-m", "venv", "venv", "--clear")
-	pythonSdkPath, err := filepath.Abs(filepath.Join("..", "..", "sdk", "python", "env", "src"))
+	pythonSdkPath, err := filepath.Abs(filepath.Join("..", "..", "sdk", "python"))
 	require.NoError(t, err)
 	e.RunCommand(filepath.Join("venv", "bin", "python"), "-m", "pip", "install", "-e", pythonSdkPath)
-	e.Env = append(e.Env, "PATH="+filepath.Join(e.CWD, "venv", "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	e.CWD = filepath.Join(e.RootPath, "go")
 	sdkPath, err := filepath.Abs("../../sdk/")
@@ -1496,4 +1572,25 @@ func TestRunPlugin(t *testing.T) {
 	e.RunCommand("pulumi", "stack", "init", "runplugin-test")
 	e.RunCommand("pulumi", "stack", "select", "runplugin-test")
 	e.RunCommand("pulumi", "preview")
+}
+
+// This checks that we provide a useful error message if the user tries to run a
+// program without a main package.
+//
+//nolint:paralleltest // ProgramTest calls t.Parallel()
+func TestErrorNoMainPackage(t *testing.T) {
+	stderr := &bytes.Buffer{}
+
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("go", "go-no-main-package"),
+		Dependencies: []string{
+			"github.com/pulumi/pulumi/sdk/v3",
+		},
+		Stderr:        stderr,
+		ExpectFailure: true,
+		Quick:         true,
+		ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
+			assert.Contains(t, stderr.String(), "does your program have a 'main' package?")
+		},
+	})
 }

@@ -15,24 +15,26 @@
 package convert
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/blang/semver"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/hcl/v2"
+	hclsyntax "github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 
 	cmdDiag "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/diag"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/newcmd"
 
-	javagen "github.com/pulumi/pulumi-java/pkg/codegen/java"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/cmd"
+	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/packagecmd"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/convert"
-	"github.com/pulumi/pulumi/pkg/v3/codegen/dotnet"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/pcl"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/schema"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
@@ -44,14 +46,13 @@ import (
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/fsutil"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/version"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
 
 	aferoUtil "github.com/pulumi/pulumi/pkg/v3/util/afero"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 )
-
-type projectGeneratorFunc func(directory string, project workspace.Project, p *pcl.Program) error
 
 func NewConvertCmd() *cobra.Command {
 	var outDir string
@@ -83,6 +84,7 @@ func NewConvertCmd() *cobra.Command {
 			}
 
 			return runConvert(
+				cmd.Context(),
 				pkgWorkspace.Instance,
 				env.Global(),
 				args,
@@ -164,29 +166,8 @@ type projectGeneratorFunction func(
 	string, string, *workspace.Project, schema.ReferenceLoader, bool,
 ) (hcl.Diagnostics, error)
 
-func generatorWrapper(generator projectGeneratorFunc, targetLanguage string) projectGeneratorFunction {
-	return func(
-		sourceDirectory, targetDirectory string, proj *workspace.Project, loader schema.ReferenceLoader, strict bool,
-	) (hcl.Diagnostics, error) {
-		contract.Requiref(proj != nil, "proj", "must not be nil")
-
-		extraOptions := make([]pcl.BindOption, 0)
-		if !strict {
-			extraOptions = append(extraOptions, pcl.NonStrictBindOptions()...)
-		}
-
-		program, diagnostics, err := pcl.BindDirectory(sourceDirectory, loader, extraOptions...)
-		if err != nil {
-			return diagnostics, fmt.Errorf("failed to bind program: %w", err)
-		} else if program == nil {
-			// We've already printed the diagnostics above
-			return diagnostics, errors.New("failed to bind program")
-		}
-		return diagnostics, generator(targetDirectory, *proj, program)
-	}
-}
-
 func runConvert(
+	ctx context.Context,
 	ws pkgWorkspace.Context,
 	e env.Env,
 	args []string,
@@ -210,15 +191,15 @@ func runConvert(
 		name = filepath.Base(cwd)
 	}
 
-	pCtx, err := newPluginContext(cwd)
+	pCtx, err := packagecmd.NewPluginContext(cwd)
 	if err != nil {
 		return fmt.Errorf("create plugin host: %w", err)
 	}
 	defer contract.IgnoreClose(pCtx.Host)
 
 	// Translate well known sources to plugins
-	switch from {
-	case "tf":
+	switch strings.ToLower(from) {
+	case "tf", "terraform":
 		from = "terraform"
 	case "":
 		from = "yaml"
@@ -234,16 +215,6 @@ func runConvert(
 
 	var projectGenerator projectGeneratorFunction
 	switch language {
-	case "dotnet":
-		projectGenerator = generatorWrapper(
-			func(targetDirectory string, proj workspace.Project, program *pcl.Program) error {
-				return dotnet.GenerateProject(targetDirectory, proj, program, nil /*localDependencies*/)
-			}, language)
-	case "java":
-		projectGenerator = generatorWrapper(
-			func(targetDirectory string, proj workspace.Project, program *pcl.Program) error {
-				return javagen.GenerateProject(targetDirectory, proj, program, nil /*localDependencies*/)
-			}, language)
 	case "pulumi", "pcl":
 		// No plugin for PCL to install dependencies with
 		generateOnly = true
@@ -276,13 +247,34 @@ func runConvert(
 			}
 			projectJSON := string(projectBytes)
 
-			diagnostics, err := languagePlugin.GenerateProject(
+			var diags hcl.Diagnostics
+			ds, err := languagePlugin.GenerateProject(
 				sourceDirectory, targetDirectory, projectJSON,
 				strict, grpcServer.Addr(), nil /*localDependencies*/)
+			diags = append(diags, ds...)
 			if err != nil {
-				return diagnostics, err
+				return nil, err
 			}
-			return diagnostics, nil
+
+			packageBlockDescriptors, ds, err := getPackagesToGenerateSdks(sourceDirectory)
+			diags = append(diags, ds...)
+			if err != nil {
+				return diags, fmt.Errorf("error parsing pcl: %w", err)
+			}
+
+			err = generateAndLinkSdksForPackages(
+				pCtx,
+				ws,
+				language,
+				filepath.Join(targetDirectory, "sdks"),
+				targetDirectory,
+				packageBlockDescriptors,
+			)
+			if err != nil {
+				return diags, fmt.Errorf("error generating packages: %w", err)
+			}
+
+			return diags, nil
 		}
 	}
 
@@ -297,31 +289,38 @@ func runConvert(
 		pCtx.Diag.Logf(sev, diag.RawMessage("", msg))
 	}
 
-	installProvider := func(provider tokens.Package) *semver.Version {
+	installPlugin := func(pluginName string) *semver.Version {
 		// If auto plugin installs are disabled just return nil, the mapper will still carry on
 		if env.DisableAutomaticPluginAcquisition.Value() {
 			return nil
 		}
 
 		pluginSpec := workspace.PluginSpec{
-			Name: string(provider),
+			Name: pluginName,
 			Kind: apitype.ResourcePlugin,
 		}
 		version, err := pkgWorkspace.InstallPlugin(pCtx.Base(), pluginSpec, log)
 		if err != nil {
-			pCtx.Diag.Warningf(diag.Message("", "failed to install provider %q: %v"), provider, err)
+			pCtx.Diag.Warningf(diag.Message("", "failed to install provider %q: %v"), pluginName, err)
 			return nil
 		}
 		return version
 	}
 
 	loader := schema.NewPluginLoader(pCtx.Host)
-	mapper, err := convert.NewPluginMapper(
-		convert.DefaultWorkspace(), convert.ProviderFactoryFromHost(pCtx.Host),
-		from, mappings, installProvider)
+
+	baseMapper, err := convert.NewBasePluginMapper(
+		convert.DefaultWorkspace(),
+		from, /*conversionKey*/
+		convert.ProviderFactoryFromHost(ctx, pCtx.Host),
+		installPlugin,
+		mappings,
+	)
 	if err != nil {
 		return fmt.Errorf("create provider mapper: %w", err)
 	}
+
+	mapper := convert.NewCachingMapper(baseMapper)
 
 	pclDirectory, err := os.MkdirTemp("", "pulumi-convert")
 	if err != nil {
@@ -457,13 +456,112 @@ func runConvert(
 	return nil
 }
 
-func newPluginContext(cwd string) (*plugin.Context, error) {
-	sink := diag.DefaultSink(os.Stderr, os.Stderr, diag.FormatOptions{
-		Color: cmdutil.GetGlobalColorization(),
-	})
-	pluginCtx, err := plugin.NewContext(sink, sink, nil, nil, cwd, nil, true, nil)
+// getPackagesToGenerateSdks parses the pcl files back in to read the package
+// blocks and for sdk generation.
+func getPackagesToGenerateSdks(
+	sourceDirectory string,
+) (map[string]*schema.PackageDescriptor, hcl.Diagnostics, error) {
+	var diagnostics hcl.Diagnostics
+
+	parser := hclsyntax.NewParser()
+	parseDiagnostics, err := pcl.ParseDirectory(parser, sourceDirectory)
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("could not parse PCL files: %w", err)
 	}
-	return pluginCtx, nil
+	diagnostics = append(diagnostics, parseDiagnostics...)
+
+	allPackageDescriptors, packageDiagnostics := pcl.ReadAllPackageDescriptors(parser.Files)
+	diagnostics = append(diagnostics, packageDiagnostics...)
+
+	if len(diagnostics) != 0 {
+		var errorDiags hcl.Diagnostics
+		for _, d := range diagnostics {
+			if d.Severity == hcl.DiagError {
+				errorDiags = append(errorDiags, d)
+			}
+		}
+
+		if len(errorDiags) != 0 {
+			return nil, diagnostics, nil
+		}
+	}
+
+	return allPackageDescriptors, diagnostics, nil
+}
+
+func generateAndLinkSdksForPackages(
+	pctx *plugin.Context,
+	ws pkgWorkspace.Context,
+	language string,
+	sdkTargetDirectory string,
+	convertOutputDirectory string,
+	pkgs map[string]*schema.PackageDescriptor,
+) error {
+	for _, pkg := range pkgs {
+		tempOut, err := os.MkdirTemp("", "gen-sdk-for-dependency-")
+		if err != nil {
+			return fmt.Errorf("failed to create temporary directory: %w", err)
+		}
+
+		if pkg.Parameterization == nil {
+			// Only generate SDKs for packages that have parameterization for now, others should be implicit.
+			continue
+		}
+
+		pkgSchema, err := packagecmd.SchemaFromSchemaSourceValueArgs(
+			pctx,
+			pkg.Name,
+			pkg.Parameterization.Value,
+		)
+		if err != nil {
+			return fmt.Errorf("creating package schema: %w", err)
+		}
+
+		err = packagecmd.GenSDK(
+			language,
+			tempOut,
+			pkgSchema,
+			/*overlays*/ "",
+			/*local*/ true,
+		)
+		if err != nil {
+			return fmt.Errorf("error generating sdk: %w", err)
+		}
+
+		sdkOut := filepath.Join(sdkTargetDirectory, pkg.Parameterization.Name)
+		err = packagecmd.CopyAll(sdkOut, filepath.Join(tempOut, language))
+		if err != nil {
+			return fmt.Errorf("failed to move SDK to project: %w", err)
+		}
+
+		err = os.RemoveAll(tempOut)
+		if err != nil {
+			return fmt.Errorf("could not remove temp dir: %w", err)
+		}
+
+		fmt.Printf("Generated local SDK for package '%s:%s'\n", pkg.Name, pkg.Parameterization.Name)
+
+		// If we don't change the working directory, the workspace instance (when
+		// reading project etc) will not be correct when doing the local sdk
+		// linking, causing errors.
+		returnToStartingDir, err := fsutil.Chdir(convertOutputDirectory)
+		if err != nil {
+			return fmt.Errorf("could not change to output directory: %w", err)
+		}
+
+		_, _, err = ws.ReadProject()
+		if err != nil {
+			return fmt.Errorf("generated root is not a valid pulumi workspace %q: %w", convertOutputDirectory, err)
+		}
+
+		sdkRelPath := filepath.Join("sdks", pkg.Parameterization.Name)
+		err = packagecmd.LinkPackage(ws, language, "./", pkgSchema, sdkRelPath)
+		if err != nil {
+			return fmt.Errorf("failed to link SDK to project: %w", err)
+		}
+
+		returnToStartingDir()
+	}
+
+	return nil
 }

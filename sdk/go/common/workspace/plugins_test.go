@@ -15,7 +15,9 @@
 package workspace
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -31,6 +33,7 @@ import (
 	"time"
 
 	"github.com/blang/semver"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/testing/diagtest"
@@ -1316,6 +1319,16 @@ func TestPluginSpec_GetSource(t *testing.T) {
 			expectedURL:        "gitlab://mygitlab.example.com/proj1",
 		},
 		{
+			name: "Use PluginDownloadURL (Git)",
+			spec: PluginSpec{
+				Name:              "test-plugin",
+				Kind:              apitype.PluginKind("resource"),
+				PluginDownloadURL: "git://github.com/test/test",
+			},
+			expectedSourceType: "*workspace.gitSource",
+			expectedURL:        "https://github.com/test/test.git",
+		},
+		{
 			name: "Use fallback source",
 			spec: PluginSpec{
 				Name: "test-plugin",
@@ -1534,6 +1547,47 @@ func TestAmbientPluginsWarn(t *testing.T) {
 }
 
 //nolint:paralleltest // modifies environment variables
+func TestAmbientBundledPluginsWarn(t *testing.T) {
+	// Get the path of this executable
+	exe, err := os.Executable()
+	require.NoError(t, err)
+
+	// Create a fake side-by-side plugin next to this executable, it must match one of our bundled names
+	bundledPath := filepath.Join(filepath.Dir(exe), "pulumi-language-nodejs")
+	err = os.WriteFile(bundledPath, []byte{}, 0o700) //nolint: gosec // we intended to write an executable file here
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		err := os.Remove(bundledPath)
+		require.NoError(t, err)
+	})
+
+	// Create a copy of the fake plugin in the path
+	pathDir := t.TempDir()
+	t.Setenv("PATH", pathDir)
+	ambientPath := filepath.Join(pathDir, "pulumi-language-nodejs")
+	err = os.WriteFile(ambientPath, []byte{}, 0o700) //nolint: gosec
+	require.NoError(t, err)
+
+	var stderr bytes.Buffer
+	d := diag.DefaultSink(
+		iotest.LogWriter(t), // stdout
+		&stderr,
+		diag.FormatOptions{Color: "never"},
+	)
+
+	// Lookup the plugin with ambient search turned on
+	t.Setenv("PULUMI_IGNORE_AMBIENT_PLUGINS", "false")
+	path, err := GetPluginPath(d, apitype.LanguagePlugin, "nodejs", nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, ambientPath, path)
+
+	// Check we get a warning about loading this plugin
+	expectedMessage := fmt.Sprintf("warning: using pulumi-language-nodejs from $PATH at %s expected %s\n",
+		ambientPath, filepath.Join(filepath.Dir(exe), "pulumi-language-nodejs"))
+	assert.Equal(t, expectedMessage, stderr.String())
+}
+
+//nolint:paralleltest // modifies environment variables
 func TestBundledPluginsDoNotWarn(t *testing.T) {
 	// Get the path of this executable
 	exe, err := os.Executable()
@@ -1690,4 +1744,414 @@ func TestProjectPluginsWithSymlink(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(tempdir, "symlink", "pulumi-resource-aws"), path)
+}
+
+func TestNewPluginSpec(t *testing.T) {
+	t.Parallel()
+
+	v1 := semver.MustParse("1.0.0")
+	v0deadbeef := semver.MustParse("0.0.0-xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	cases := []struct {
+		name               string
+		source             string
+		version            *semver.Version
+		kind               apitype.PluginKind
+		pluginDownloadURL  string
+		ExpectedPluginSpec PluginSpec
+		Error              error
+	}{
+		{
+			name:   "regular plugin",
+			source: "pulumi-example",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "pulumi-example",
+				Kind:              apitype.ResourcePlugin,
+				Version:           nil,
+				PluginDownloadURL: "",
+				PluginDir:         "",
+				Checksums:         nil,
+			},
+		},
+		{
+			name:   "plugin with version",
+			source: "pulumi-example@v1.0.0",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "pulumi-example",
+				Kind:              apitype.ResourcePlugin,
+				Version:           &v1,
+				PluginDownloadURL: "",
+				PluginDir:         "",
+				Checksums:         nil,
+			},
+		},
+		{
+			name:   "plugin with invalid semver",
+			source: "pulumi-example@v1.0.0.0",
+			kind:   apitype.ResourcePlugin,
+			Error:  errors.New("VERSION must be valid semver: Invalid character(s) found in patch number \"0.0\""),
+		},
+		{
+			name:   "git plugin",
+			source: "github.com/pulumi/pulumi-example",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "github.com_pulumi_pulumi-example.git",
+				Kind:              apitype.ResourcePlugin,
+				Version:           nil,
+				PluginDownloadURL: "git://github.com/pulumi/pulumi-example",
+				PluginDir:         "",
+				Checksums:         nil,
+			},
+		},
+		{
+			name:   "git plugin with version",
+			source: "github.com/pulumi/pulumi-example@v1.0.0",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "github.com_pulumi_pulumi-example.git",
+				Kind:              apitype.ResourcePlugin,
+				Version:           &v1,
+				PluginDownloadURL: "git://github.com/pulumi/pulumi-example",
+				PluginDir:         "",
+				Checksums:         nil,
+			},
+		},
+		{
+			name:   "git plugin with commit hash version",
+			source: "github.com/pulumi/pulumi-example@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "github.com_pulumi_pulumi-example.git",
+				Kind:              apitype.ResourcePlugin,
+				Version:           &v0deadbeef,
+				PluginDownloadURL: "git://github.com/pulumi/pulumi-example",
+				PluginDir:         "",
+				Checksums:         nil,
+			},
+		},
+		{
+			name:   "git plugin with invalid version hash",
+			source: "github.com/pulumi/pulumi-example@abcdxyz",
+			kind:   apitype.ResourcePlugin,
+			Error:  errors.New("VERSION must be valid semver or git commit hash: abcdxyz"),
+		},
+		{
+			name:   "https prefixed git plugin",
+			source: "https://github.com/pulumi/pulumi-example",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "github.com_pulumi_pulumi-example.git",
+				Kind:              apitype.ResourcePlugin,
+				Version:           nil,
+				PluginDownloadURL: "git://github.com/pulumi/pulumi-example",
+				PluginDir:         "",
+				Checksums:         nil,
+			},
+		},
+		{
+			name:   "https prefixed git plugin with version",
+			source: "https://github.com/pulumi/pulumi-example@v1.0.0",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "github.com_pulumi_pulumi-example.git",
+				Kind:              apitype.ResourcePlugin,
+				Version:           &v1,
+				PluginDownloadURL: "git://github.com/pulumi/pulumi-example",
+				PluginDir:         "",
+				Checksums:         nil,
+			},
+		},
+		{
+			name:   "https prefixed git plugin with commit hash version",
+			source: "https://github.com/pulumi/pulumi-example@deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "github.com_pulumi_pulumi-example.git",
+				Kind:              apitype.ResourcePlugin,
+				Version:           &v0deadbeef,
+				PluginDownloadURL: "git://github.com/pulumi/pulumi-example",
+				PluginDir:         "",
+				Checksums:         nil,
+			},
+		},
+		{
+			name:   "https prefixed git plugin with invalid version hash",
+			source: "https://github.com/pulumi/pulumi-example@abcdxyz",
+			kind:   apitype.ResourcePlugin,
+			Error:  errors.New("VERSION must be valid semver or git commit hash: abcdxyz"),
+		},
+		{
+			name:   "https:// prefixed with no . in URL",
+			source: "https://localhost/test/repo",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "localhost_test_repo.git",
+				Kind:              apitype.ResourcePlugin,
+				PluginDownloadURL: "git://localhost/test/repo",
+			},
+		},
+		{
+			name:   "no . in URL gets treated as local path",
+			source: "localhost/test/repo",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name: "localhost/test/repo",
+				Kind: apitype.ResourcePlugin,
+			},
+		},
+		{
+			name:   "local plugin",
+			source: "./test/plugin",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "./test/plugin",
+				Kind:              apitype.ResourcePlugin,
+				Version:           nil,
+				PluginDownloadURL: "",
+				Checksums:         nil,
+			},
+		},
+		{
+			name:   "local plugin absolute path",
+			source: "/test/plugin",
+			kind:   apitype.ResourcePlugin,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "/test/plugin",
+				Kind:              apitype.ResourcePlugin,
+				Version:           nil,
+				PluginDownloadURL: "",
+				Checksums:         nil,
+			},
+		},
+		{
+			name:    "conflicting versions error",
+			source:  "plugin@v1.0.0",
+			version: &v1,
+			kind:    apitype.ResourcePlugin,
+			Error:   errors.New("cannot specify a version when the version is part of the name"),
+		},
+		{
+			name:    "passed in version is used",
+			source:  "plugin",
+			kind:    apitype.ResourcePlugin,
+			version: &v1,
+			ExpectedPluginSpec: PluginSpec{
+				Name:              "plugin",
+				Kind:              apitype.ResourcePlugin,
+				Version:           &v1,
+				PluginDownloadURL: "",
+				Checksums:         nil,
+			},
+		},
+		{
+			name:              "plugin download url and git url",
+			source:            "github.com/pulumi/pulumi-example@v1.0.0",
+			kind:              apitype.ResourcePlugin,
+			pluginDownloadURL: "https://example.com/pulumi-example",
+			Error:             errors.New("cannot specify a plugin download URL when the plugin name is a URL"),
+		},
+		{
+			name:   "invalid version with git plugin",
+			source: "github.com/pulumi/pulumi-example@v1.0.0.0",
+			kind:   apitype.ResourcePlugin,
+			Error:  errors.New("VERSION must be valid semver or git commit hash: v1.0.0.0"),
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			spec, err := NewPluginSpec(c.source, c.kind, c.version, c.pluginDownloadURL, nil)
+			if c.Error != nil {
+				require.EqualError(t, err, c.Error.Error())
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, c.ExpectedPluginSpec, spec)
+		})
+	}
+}
+
+func TestGitSourceDownloadSemver(t *testing.T) {
+	t.Parallel()
+
+	// Create a fake plugin.
+	version := semver.MustParse("1.0.0")
+
+	gitSource := &gitSource{
+		url:  "https://example.com/repo/test",
+		path: "path",
+		cloneOrPull: func(ctx context.Context, url string, ref plumbing.ReferenceName, tmpdir string, shallow bool) error {
+			require.Equal(t, "https://example.com/repo/test", url)
+			require.Equal(t, plumbing.ReferenceName("refs/tags/v1.0.0"), ref)
+			err := os.MkdirAll(filepath.Join(tmpdir, "path"), 0o700)
+			require.NoError(t, err)
+			err = os.WriteFile(filepath.Join(tmpdir, filepath.Join("path", "test")), []byte("a string"), 0o600)
+			require.NoError(t, err)
+
+			return nil
+		},
+	}
+	readCloser, l, err := gitSource.Download(context.Background(), version, "unused", "unused",
+		func(*http.Request) (io.ReadCloser, int64, error) { panic("unused") })
+	require.NoError(t, err)
+	require.NotNil(t, readCloser)
+	require.Greater(t, l, int64(0))
+
+	zip, err := gzip.NewReader(readCloser)
+	require.NoError(t, err)
+
+	tarReader := tar.NewReader(zip)
+	header, err := tarReader.Next()
+	require.NoError(t, err)
+	require.Equal(t, "path/test", header.Name)
+
+	buf, err := io.ReadAll(tarReader)
+	require.NoError(t, err)
+	require.Equal(t, "a string", string(buf))
+}
+
+func TestGitSourceDownloadHEAD(t *testing.T) {
+	t.Parallel()
+
+	// Create a fake plugin.
+	version := semver.Version{}
+
+	gitSource := &gitSource{
+		url:  "https://example.com/repo/test",
+		path: "path",
+		cloneOrPull: func(ctx context.Context, url string, ref plumbing.ReferenceName, tmpdir string, shallow bool) error {
+			require.Equal(t, "https://example.com/repo/test", url)
+			require.Equal(t, plumbing.HEAD, ref)
+			err := os.MkdirAll(filepath.Join(tmpdir, "path"), 0o700)
+			require.NoError(t, err)
+			err = os.WriteFile(filepath.Join(tmpdir, filepath.Join("path", "test")), []byte("a string"), 0o600)
+			require.NoError(t, err)
+
+			return nil
+		},
+	}
+	readCloser, l, err := gitSource.Download(context.Background(), version, "unused", "unused",
+		func(*http.Request) (io.ReadCloser, int64, error) { panic("unused") })
+	require.NoError(t, err)
+	require.NotNil(t, readCloser)
+	require.Greater(t, l, int64(0))
+
+	zip, err := gzip.NewReader(readCloser)
+	require.NoError(t, err)
+
+	tarReader := tar.NewReader(zip)
+	header, err := tarReader.Next()
+	require.NoError(t, err)
+	require.Equal(t, "path/test", header.Name)
+
+	buf, err := io.ReadAll(tarReader)
+	require.NoError(t, err)
+	require.Equal(t, "a string", string(buf))
+}
+
+func TestGitSourceDownloadHash(t *testing.T) {
+	t.Parallel()
+
+	// Create a fake plugin.
+	version := semver.MustParse("0.0.0-xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+
+	gitSource := &gitSource{
+		url:  "https://example.com/repo/test",
+		path: "path",
+		cloneAndCheckoutRevision: func(ctx context.Context, url string, revision plumbing.Revision, tmpdir string) error {
+			require.Equal(t, "https://example.com/repo/test", url)
+			require.Equal(t, plumbing.Revision("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"), revision)
+			err := os.MkdirAll(filepath.Join(tmpdir, "path"), 0o700)
+			require.NoError(t, err)
+			err = os.WriteFile(filepath.Join(tmpdir, filepath.Join("path", "test")), []byte("a string"), 0o600)
+			require.NoError(t, err)
+
+			return nil
+		},
+	}
+	readCloser, l, err := gitSource.Download(context.Background(), version, "unused", "unused",
+		func(*http.Request) (io.ReadCloser, int64, error) { panic("unused") })
+	require.NoError(t, err)
+	require.NotNil(t, readCloser)
+	require.Greater(t, l, int64(0))
+
+	zip, err := gzip.NewReader(readCloser)
+	require.NoError(t, err)
+
+	tarReader := tar.NewReader(zip)
+	header, err := tarReader.Next()
+	require.NoError(t, err)
+	require.Equal(t, "path/test", header.Name)
+
+	buf, err := io.ReadAll(tarReader)
+	require.NoError(t, err)
+	require.Equal(t, "a string", string(buf))
+}
+
+func TestGitSourceGetLatestVersion(t *testing.T) {
+	t.Parallel()
+
+	gitSource := &gitSource{
+		url: "testdata/latest-version.git",
+	}
+	version, err := gitSource.GetLatestVersion(context.Background(), func(*http.Request) (io.ReadCloser, int64, error) {
+		panic("should not be called")
+	})
+	require.NoError(t, err)
+	require.Equal(t, semver.MustParse("0.1.1"), *version)
+}
+
+func TestLocalName(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name              string
+		pluginName        string
+		pluginDownloadURL string
+		expected          string
+		expectedPath      string
+	}{
+		{
+			name:       "simple",
+			pluginName: "pulumi-example",
+			expected:   "pulumi-example",
+		},
+		{
+			name:              "git plugin download url",
+			pluginName:        "pulumi-example",
+			pluginDownloadURL: "git://github.com/pulumi/pulumi-example",
+			expected:          "github.com_pulumi_pulumi-example.git",
+		},
+		{
+			name:              "git plugin download url with path",
+			pluginName:        "pulumi-example",
+			pluginDownloadURL: "git://github.com/pulumi/pulumi-example/path",
+			expected:          "github.com_pulumi_pulumi-example.git",
+			expectedPath:      "path",
+		},
+		{
+			name:              "invalid git plugin download url",
+			pluginName:        "pulumi-example",
+			pluginDownloadURL: "git://github",
+			expected:          "github",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			spec := PluginSpec{
+				Name:              c.pluginName,
+				PluginDownloadURL: c.pluginDownloadURL,
+			}
+			name, path := spec.LocalName()
+			require.Equal(t, c.expected, name)
+			require.Equal(t, c.expectedPath, path)
+		})
+	}
 }

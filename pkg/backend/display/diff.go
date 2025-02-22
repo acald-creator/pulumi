@@ -111,8 +111,7 @@ func RenderDiffEvent(event engine.Event, seen map[resource.URN]engine.StepEventM
 	case engine.PreludeEvent:
 		return renderPreludeEvent(event.Payload().(engine.PreludeEventPayload), opts)
 	case engine.SummaryEvent:
-		const wroteDiagnosticHeader = false
-		return renderSummaryEvent(event.Payload().(engine.SummaryEventPayload), wroteDiagnosticHeader, true, opts)
+		return renderSummaryEvent(event.Payload().(engine.SummaryEventPayload), true, opts)
 	case engine.StdoutColorEvent:
 		return renderStdoutColorEvent(event.Payload().(engine.StdoutEventPayload), opts)
 
@@ -171,7 +170,7 @@ func renderDiffPolicyRemediationEvent(payload engine.PolicyRemediationEventPaylo
 	if detailed {
 		var b bytes.Buffer
 		PrintObjectDiff(&b, *diff, nil,
-			false /*planning*/, 2, true /*summary*/, true /*truncateOutput*/, false /*debug*/)
+			false /*planning*/, 2, true /*summary*/, true /*truncateOutput*/, false /*debug*/, opts.ShowSecrets)
 		remediationLine = fmt.Sprintf("%s\n%s", remediationLine, b.String())
 	} else {
 		var b bytes.Buffer
@@ -220,14 +219,8 @@ func renderStdoutColorEvent(payload engine.StdoutEventPayload, opts Options) str
 	return opts.Color.Colorize(payload.Message)
 }
 
-func renderSummaryEvent(event engine.SummaryEventPayload, hasError bool, diffStyleSummary bool, opts Options) string {
+func renderSummaryEvent(event engine.SummaryEventPayload, diffStyleSummary bool, opts Options) string {
 	changes := event.ResourceChanges
-
-	// If this is a failed preview, do not render anything. It could be surprising/misleading as it doesn't
-	// describe the totality of the proposed changes (for instance, could be missing resources if it errored early).
-	if event.IsPreview && hasError {
-		return ""
-	}
 
 	out := &bytes.Buffer{}
 	fprintIgnoreError(out, opts.Color.Colorize(
@@ -395,15 +388,17 @@ func renderDiff(
 		if metadata.DetailedDiff != nil {
 			var buf bytes.Buffer
 			if diff := engine.TranslateDetailedDiff(&metadata, refresh); diff != nil {
-				PrintObjectDiff(&buf, *diff, nil /*include*/, planning, indent+1, opts.SummaryDiff, opts.TruncateOutput, debug)
+				PrintObjectDiff(&buf, *diff, nil /*include*/, planning, indent+1,
+					opts.SummaryDiff, opts.TruncateOutput, debug, opts.ShowSecrets)
 			} else {
 				PrintObject(
-					&buf, metadata.Old.Inputs, planning, indent+1, deploy.OpSame, true /*prefix*/, opts.TruncateOutput, debug)
+					&buf, metadata.Old.Inputs, planning, indent+1, deploy.OpSame, true, /*prefix*/
+					opts.TruncateOutput, debug, opts.ShowSecrets)
 			}
 			details = buf.String()
 		} else {
 			details = getResourcePropertiesDetails(
-				metadata, indent, planning, opts.SummaryDiff, opts.TruncateOutput, debug)
+				metadata, indent, planning, opts.SummaryDiff, opts.TruncateOutput, debug, opts.ShowSecrets)
 		}
 	}
 	fprintIgnoreError(out, opts.Color.Colorize(summary))
@@ -473,7 +468,7 @@ func renderDiffResourceOutputsEvent(
 			// things that are the same.
 			text := getResourceOutputsPropertiesString(
 				payload.Metadata, indent+1, payload.Planning,
-				payload.Debug, refresh, opts.ShowSameResources)
+				payload.Debug, refresh, opts.ShowSameResources, opts.ShowSecrets)
 			if text != "" {
 				header := fmt.Sprintf("%v%v--outputs:--%v\n",
 					deploy.Color(payload.Metadata.Op), getIndentationString(indent+1, payload.Metadata.Op, false), colors.Reset)

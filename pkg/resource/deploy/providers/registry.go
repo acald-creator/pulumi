@@ -213,21 +213,23 @@ func GetProviderName(name tokens.Package, inputs resource.PropertyMap) (tokens.P
 }
 
 // Sets the provider parameterization in the given property map, this should be called _after_ SetVersion.
-func SetProviderParameterization(inputs resource.PropertyMap, value *ProviderParameterization) {
+func SetProviderParameterization(inputs resource.PropertyMap, value *workspace.Parameterization) {
 	internalInputs := addOrGetInternal(inputs)
 
 	// SetVersion will have written the base plugin version to inputs["version"], if we're parameterized we need to move
 	// it, and replace it with our package version.
 	internalInputs[versionKey] = inputs[versionKey]
-	inputs[versionKey] = resource.NewStringProperty(value.version.String())
+	inputs[versionKey] = resource.NewStringProperty(value.Version.String())
 	// We don't write name here because we can reconstruct that from the providers type token
 	internalInputs[parameterizationKey] = resource.NewStringProperty(
-		base64.StdEncoding.EncodeToString(value.value))
+		base64.StdEncoding.EncodeToString(value.Value))
 }
 
 // GetProviderParameterization fetches and parses a provider parameterization from the given property map. If the
 // parameterization property is not present, this function returns nil.
-func GetProviderParameterization(name tokens.Package, inputs resource.PropertyMap) (*ProviderParameterization, error) {
+func GetProviderParameterization(
+	name tokens.Package, inputs resource.PropertyMap,
+) (*workspace.Parameterization, error) {
 	internalInputs, err := getInternal(inputs)
 	if err != nil {
 		return nil, err
@@ -258,10 +260,10 @@ func GetProviderParameterization(name tokens.Package, inputs resource.PropertyMa
 		return nil, fmt.Errorf("could not parse provider version: %w", err)
 	}
 
-	return &ProviderParameterization{
-		name:    name,
-		version: sv,
-		value:   bytes,
+	return &workspace.Parameterization{
+		Name:    string(name),
+		Version: sv,
+		Value:   bytes,
 	}, nil
 }
 
@@ -344,7 +346,7 @@ func loadProvider(ctx context.Context, pkg tokens.Package, version *semver.Versi
 func loadParameterizedProvider(
 	ctx context.Context,
 	name tokens.Package, version *semver.Version, downloadURL string, checksums map[string][]byte,
-	parameter *ProviderParameterization,
+	parameter *workspace.Parameterization,
 	host plugin.Host, builtins plugin.Provider,
 ) (plugin.Provider, error) {
 	provider, err := loadProvider(ctx, name, version, downloadURL, checksums, host, builtins)
@@ -355,24 +357,24 @@ func loadParameterizedProvider(
 	if parameter != nil {
 		resp, err := provider.Parameterize(context.TODO(), plugin.ParameterizeRequest{
 			Parameters: &plugin.ParameterizeValue{
-				Name:    string(parameter.name),
-				Version: parameter.version,
-				Value:   parameter.value,
+				Name:    parameter.Name,
+				Version: parameter.Version,
+				Value:   parameter.Value,
 			},
 		})
 		if err != nil {
 			return nil, err
 		}
-		if resp.Name != string(parameter.name) {
-			return nil, fmt.Errorf("parameterize response name %q does not match expected package %q", resp.Name, parameter.name)
+		if resp.Name != parameter.Name {
+			return nil, fmt.Errorf("parameterize response name %q does not match expected package %q", resp.Name, parameter.Name)
 		}
 	}
 	return provider, nil
 }
 
-// filterProviderConfig filters out the __internal key from provider state so the resulting map can be passed to
+// FilterProviderConfig filters out the __internal key from provider state so the resulting map can be passed to
 // provider plugins.
-func filterProviderConfig(inputs resource.PropertyMap) resource.PropertyMap {
+func FilterProviderConfig(inputs resource.PropertyMap) resource.PropertyMap {
 	result := resource.PropertyMap{}
 	for k, v := range inputs {
 		if k == internalKey {
@@ -547,8 +549,8 @@ func (r *Registry) Check(ctx context.Context, req plugin.CheckRequest) (plugin.C
 	// Check the provider's config. If the check fails, unload the provider.
 	resp, err := provider.CheckConfig(ctx, plugin.CheckConfigRequest{
 		URN:           req.URN,
-		Olds:          filterProviderConfig(req.Olds),
-		News:          filterProviderConfig(req.News),
+		Olds:          FilterProviderConfig(req.Olds),
+		News:          FilterProviderConfig(req.News),
 		AllowUnknowns: true,
 	})
 	if len(resp.Failures) != 0 || err != nil {
@@ -605,10 +607,10 @@ func (r *Registry) Diff(ctx context.Context, req plugin.DiffRequest) (plugin.Dif
 	}
 
 	// Diff the properties.
-	filteredNewInputs := filterProviderConfig(req.NewInputs)
+	filteredNewInputs := FilterProviderConfig(req.NewInputs)
 	diff, err := provider.DiffConfig(context.Background(), plugin.DiffConfigRequest{
 		URN:           req.URN,
-		OldInputs:     filterProviderConfig(req.OldInputs),
+		OldInputs:     FilterProviderConfig(req.OldInputs),
 		OldOutputs:    req.OldOutputs, // OldOutputs is already filtered
 		NewInputs:     filteredNewInputs,
 		AllowUnknowns: req.AllowUnknowns,
@@ -695,7 +697,7 @@ func (r *Registry) Same(ctx context.Context, res *resource.State) error {
 	contract.Assertf(provider != nil, "provider must not be nil")
 
 	if _, err := provider.Configure(context.Background(), plugin.ConfigureRequest{
-		Inputs: filterProviderConfig(res.Inputs),
+		Inputs: FilterProviderConfig(res.Inputs),
 	}); err != nil {
 		closeErr := r.host.CloseProvider(provider)
 		contract.IgnoreError(closeErr)
@@ -759,7 +761,7 @@ func (r *Registry) Create(ctx context.Context, req plugin.CreateRequest) (plugin
 		}
 	}
 
-	filteredProperties := filterProviderConfig(req.Properties)
+	filteredProperties := FilterProviderConfig(req.Properties)
 	if _, err := provider.Configure(context.Background(), plugin.ConfigureRequest{
 		Inputs: filteredProperties,
 	}); err != nil {
@@ -799,7 +801,7 @@ func (r *Registry) Update(ctx context.Context, req plugin.UpdateRequest) (plugin
 	provider, ok := r.deleteProvider(mustNewReference(req.URN, UnconfiguredID))
 	contract.Assertf(ok, "'Check' and 'Diff' must be called before 'Update' (%v)", req.URN)
 
-	filteredProperties := filterProviderConfig(req.NewInputs)
+	filteredProperties := FilterProviderConfig(req.NewInputs)
 	if _, err := provider.Configure(ctx, plugin.ConfigureRequest{Inputs: filteredProperties}); err != nil {
 		return plugin.UpdateResponse{Status: resource.StatusUnknown}, err
 	}

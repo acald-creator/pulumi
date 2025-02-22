@@ -12,6 +12,7 @@ coverage.cov
 *.cov
 **/obj/
 coverage/
+junit/
 venv/
 .envrc
 # Ignore VSCode created solution file
@@ -82,7 +83,7 @@ __pycache__
 .pytest_cache
 
 # File targets for make
-*.phony
+.make
 
 # Temporary files
 *.tmp
